@@ -1,0 +1,24 @@
+# Local environment (.venv, third_party and artifacts are symlinks into the CP-5 checkout) and caches
+.venv
+.venv*/
+third_party
+artifacts
+.local/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.cache/
+build/
+dist/
+# Credentials and generated data
+.private/
+.env
+.env.*
+!.env.example
+runs/
+*.log
+# Editors
+.vscode/
+.idea/
+.DS_Store
