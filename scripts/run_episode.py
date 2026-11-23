@@ -24,6 +24,11 @@ class GoalReached(BaseException):
     """LIBERO's done: ends the episode from the step callback (BaseException passes the harness's handlers)."""
 
 
+class CapReached(BaseException):
+    """The test limit (control time or model calls, evaluator-side): ends the episode as a failure wherever the
+    policy is (stepping, planning or waiting for a model answer)."""
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--task", required=True)
@@ -50,6 +55,12 @@ def main():
     ap.add_argument("--compiles", type=int, default=1, help="PROGRAM compiles for term confidence (1 = off)")
     ap.add_argument("--true-scene", action="store_true",
                     help="evaluator: save the simulator's true scene at every TRACE request (trace/true/)")
+    ap.add_argument("--cap-control-s", type=float, default=None,
+                    help="evaluator: stop the episode as a failure when the control time (policy wall clock, "
+                         "model waits included) reaches this many seconds")
+    ap.add_argument("--cap-calls", type=int, default=None,
+                    help="evaluator: stop the episode as a failure when the policy asks for a model call beyond "
+                         "this many")
     args = ap.parse_args()
 
     minor = GPU_MINOR[args.gpu]
@@ -78,7 +89,44 @@ def main():
     seg.load()
     astra = AstraClient(out / "model", effort=args.effort, max_calls=args.max_calls)
     frames = []
+
+    # Test limits (evaluator-side, the harness itself stays as it is): a timer thread or the call counter sends
+    # SIGUSR1 to the main thread, whose handler raises CapReached there, also out of a wait for a model answer.
+    import signal
+    import threading
+    from atrace.llm import AstraError
+    cap = {"armed": False, "why": None, "t": None, "calls": None}
+    main_ident = threading.main_thread().ident
+
+    def cap_fire(why):
+        if cap["armed"] and cap["why"] is None:
+            cap["why"] = why
+            signal.pthread_kill(main_ident, signal.SIGUSR1)
+
+    def on_cap_signal(signum, frame):
+        if cap["armed"]:
+            cap["armed"] = False
+            raise CapReached(cap["why"] or "control_time")
+
+    signal.signal(signal.SIGUSR1, on_cap_signal)
+    if args.cap_calls is not None:
+        astra_call = astra.call
+
+        def capped_call(kind, *a, **k):           # astra.submit looks up self.call, so pool calls pass here too
+            with astra._lock:
+                over = len(astra.calls) >= args.cap_calls
+            if over:
+                cap_fire("model_calls")
+                raise AstraError("model call cap reached", code="cap")
+            return astra_call(kind, *a, **k)
+        astra.call = capped_call
     t_start = time.time()
+    if args.cap_control_s is not None or args.cap_calls is not None:
+        cap["armed"] = True
+    if args.cap_control_s is not None:
+        timer = threading.Timer(args.cap_control_s, cap_fire, args=("control_time",))
+        timer.daemon = True
+        timer.start()
     rec = None
     import hashlib
     build = hashlib.sha256(b"".join(f.read_bytes() for d in ("atrace", "traceplan")
@@ -105,6 +153,7 @@ def main():
                 if rec is not None:
                     rec.on_step(robot, ob)
                 if env.check_success():
+                    cap["armed"] = False               # LIBERO's done came first: the limit no longer applies
                     raise GoalReached
             robot = SimRobot(env, on_step=on_step)
             h = Harness(robot, language, out, astra, seg, max_wall_s=args.max_wall,
@@ -123,11 +172,19 @@ def main():
             try:
                 status = h.run()
                 robot.hold(10)
+                cap["armed"] = False
             except GoalReached:
                 success_step = robot.steps
                 if not h._events.closed:           # stopped inside the policy: end its log as Harness.run does
                     h.log("end", status=status, timing=h.timing, astra=astra.stats())
                     h._events.close()
+            except CapReached as e:
+                status = f"cap_{e}"
+                cap.update(t=round(time.time() - t_start, 1), calls=len(astra.calls))
+                if not h._events.closed:
+                    h.log("end", status=status, timing=h.timing, astra=astra.stats(), cap=cap)
+                    h._events.close()
+            cap["armed"] = False
             t_policy = time.time() - t_start
             col = monitor.result(raw_goal_success=bool(env.check_success()))
     wall = time.time() - t_start
@@ -138,6 +195,9 @@ def main():
         "motion": args.motion, "placement": args.placement, "status": status,
         "policy_finished": h.finished,
         "success": success, "success_step": success_step,
+        "cap": {"control_s": args.cap_control_s, "calls": args.cap_calls,
+                "reached": cap["why"] if status.startswith("cap_") else None,
+                "at_s": cap["t"], "calls_at_stop": cap["calls"]},
         "scene_collision_free": col.get("scene_collision_free"),
         "added_obstacle_collision_free": col.get("added_obstacle_collision_free"),
         "collision_free_success": success and bool(col.get("scene_collision_free")),
@@ -185,6 +245,9 @@ def main():
                                               "scene_collision_free", "wall_s_policy", "sim_steps")}, default=str))
     print("model:", summary["model"])
     print("out:", out)
+    if status.startswith("cap_"):
+        sys.stdout.flush()
+        os._exit(0)          # everything is written; do not wait for a model answer still in flight
 
 
 if __name__ == "__main__":
