@@ -85,15 +85,18 @@ def box_scene(boxes=(), spheres=(), table_z=0.0, bounds=((0.05, -0.45, -0.02), (
         entities[d["id"]] = Entity(d["id"], i + 1, surf(d), S, {"top_center": c + [0, 0, hz], "base": c - [0, 0, hz],
                                                                 "centroid": c})
     unk, shadow = np.zeros(shape, bool), np.zeros(shape, np.int16)
+    unknown_boxes = list(unknown)
     for u in unknown:
         m = _sdf_box(C, u) <= 0
         unk |= m & ~occ
         if u.get("shadow_of"):
             shadow[m & ~occ] = entities[u["shadow_of"]].label
 
-    def exact(pts, exclude=()):
+    def exact(pts, exclude=(), unknown=False):
         pts = np.asarray(pts, float).reshape(-1, 3)
         ds = [sdf(pts, d) for d, sdf, _, _ in shapes if d["id"] not in exclude]
+        if unknown:
+            ds += [_sdf_box(pts, u) for u in unknown_boxes if u.get("shadow_of") not in exclude]
         return np.min(ds, axis=0) if ds else np.full(len(pts), 1.0)
 
     return SceneSnapshot(version, lo, float(res), occ, unk, labels, shadow, table_z, entities, exact, {})

@@ -138,6 +138,9 @@ class ControllerModel:
         return Q, np.linalg.norm(p - ps, axis=1), np.linalg.norm(rot_err(R, Rs), axis=1)
 
 
+JOINT_SLACK = 0.10      # rad: an end posture keeps this far from every joint limit when it can (see ik_check)
+
+
 def _zone_need(margin, c, p, zone):
     """Per-sample required clearance with the "do not get closer" rule within `zone` of either end."""
     need = np.full(len(c), margin)
@@ -163,27 +166,56 @@ def make_arm_check(h, margins, zone, finger=0.04, cfg=ARM):
     def arm_check(R, p, s, q_ref):
         Q, ep, er = cm.rollout(q0, R, p, q_ref)
         W = rm.points_world(rm.full_q(Q, finger), groups=[0])
-        c = (ck.point_clearance(W, held) - pr).min(1)
+        Cw = ck.point_clearance(W, held, unknown=False) - pr      # observed geometry: the hard check
+        c = Cw.min(1)
+        # unseen space is not refused: the arm crosses it slowly (it lowers the slack the retimer sets speed from)
+        cu = (ck.point_clearance(W, held, unknown=True) - pr).min(1)
         cpl = (W[..., 2] - tz - 0.5 * pr).min(1)          # CP-5's plane rule: sample spacing counts half
-        lim_gap = np.minimum(Q - cm.lo, cm.hi - Q).min(1)
+        gap = np.minimum(Q - cm.lo, cm.hi - Q)
+        lim_gap = gap.min(1)
         unreach = (ep > cfg["err_p"]) | (er > cfg["err_r"])
         at_lim = lim_gap < cfg["at_limit"]
         jump = np.r_[False, np.abs(np.diff(Q, axis=0)).max(1) > cfg["dq_max"]]
         close = (c < _zone_need(m_arm, c, p, zone)) | (cpl < _zone_need(m_plane, cpl, p, zone))
         bad = unreach | at_lim | jump | close
-        slack = np.minimum(c - margins["guard"]["arm"] - margins["perception"], cpl - margins["guard_plane"]["arm"])
+        slack = np.minimum(np.minimum(c, cu) - margins["guard"]["arm"] - margins["perception"],
+                           cpl - margins["guard_plane"]["arm"])
         if not bad.any():
             return ArmResult(True, Q, None, None, float(min(c.min(), cpl.min())), slack)
         i = int(np.argmax(bad))
         why = ("joint_limit" if at_lim[i] else "unreachable") if unreach[i] else \
             "joint_limit" if at_lim[i] else "discontinuous" if jump[i] else "arm_clearance"
-        return ArmResult(False, Q, why, float(s[i]), float(min(c.min(), cpl.min())), slack)
+        if why == "joint_limit":
+            j = int(np.argmin(gap[i]))
+            detail = {"joint": j + 1, "q": round(float(Q[i, j]), 3), "margin": round(float(gap[i, j]), 3)}
+        elif why == "unreachable":
+            detail = {"err_p": round(float(ep[i]), 4), "err_r": round(float(er[i]), 4)}
+        elif why == "arm_clearance":
+            k = int(np.argmin(Cw[i]))
+            detail = {"at": np.round(W[i, k], 4).tolist(), "clearance": round(float(min(c[i], cpl[i])), 4),
+                      "plane": bool(cpl[i] < c[i])}
+        else:
+            detail = {"jump": round(float(np.abs(np.diff(Q, axis=0)).max(1)[i - 1]), 3)}
+        return ArmResult(False, Q, why, float(s[i]), float(min(c.min(), cpl.min())), slack, detail)
     return arm_check
 
 
 def make_ik_check(h, finger=0.04):
     """TRACE's ik_check for free ends: CP-5's multi-seed IK."""
+    lim = h.rm.limits[:7]
+
     def ik_check(R, p, q_seed=None):
-        sols = h.rm.solve_ik(R, p, h.rb.q()[:7] if q_seed is None else q_seed, n_random=8, finger=finger)
-        return (True, sols[0]) if len(sols) else (False, None)
+        # few seeds first; more before an end is given up (a narrow IK query misses postures that exist). Among the
+        # solutions, the nearest one that keeps every joint JOINT_SLACK from its limits (the next move starts there)
+        q0 = h.rb.q()[:7] if q_seed is None else q_seed
+        for n in (8, 32):
+            sols = h.rm.solve_ik(R, p, q0, n_random=n, finger=finger)
+            if len(sols):
+                m = np.minimum(sols - lim[:, 0], lim[:, 1] - sols).min(1)
+                ok = np.flatnonzero(m >= JOINT_SLACK)
+                if len(ok):
+                    return True, sols[ok[0]]
+                if n == 32:
+                    return True, sols[int(np.argmax(m))]
+        return False, None
     return ik_check

@@ -46,10 +46,16 @@ def main():
     ap.add_argument("--no-render", action="store_true", help="with --video: record but skip the post-episode videos")
     ap.add_argument("--motion", choices=["trace", "v0", "cp5"], default="trace",
                     help="contact-free segments: TRACE search | TRACE contract with CP-5 seeds only | CP-5 planner")
-    ap.add_argument("--placement", choices=["ladder", "v1", "v2"], default="ladder",
+    ap.add_argument("--placement", choices=["ladder", "v1", "v2", "unified"], default="ladder",
                     help="putting the held object down: careful planner with the margin ladder | the same planner "
                          "ranking instead of rejecting (tier 3) | no planner: System 1 points, contact ends the "
-                         "descent, System 1 judges the result (r1's mechanism)")
+                         "descent, System 1 judges the result (r1's mechanism) | unified: System 1 points, geometry "
+                         "finds the rest pose, the way down carries its expected contact, the gripper opens only when "
+                         "it holds (CONTACT_STAGE_PLAN.md)")
+    ap.add_argument("--in-release", choices=["program", "drop", "place"], default="program",
+                    help="every \"in\" transfer releases this way (drop: let go at the lowest height up to 12 cm above "
+                         "the rest where the open hand is clear; place: set down on the floor), whatever the program "
+                         "says; program: as the program says")
     ap.add_argument("--trace-device", default="cuda:0")
     ap.add_argument("--trace-budget-ms", type=float, default=2000.0)
     ap.add_argument("--compiles", type=int, default=1, help="PROGRAM compiles for term confidence (1 = off)")
@@ -159,7 +165,8 @@ def main():
             h = Harness(robot, language, out, astra, seg, max_wall_s=args.max_wall,
                         verify=not args.no_verify, prompt_note=args.hint, motion=args.motion,
                         trace_device=args.trace_device, trace_budget_ms=args.trace_budget_ms, compiles=args.compiles,
-                        placement=args.placement)
+                        placement=args.placement,
+                        in_release=None if args.in_release == "program" else args.in_release)
             if args.true_scene and h.tm is not None:
                 # evaluator-side truth for the certificate measures: the harness hands over the request id only
                 sys.path.insert(0, str(ROOT / "scripts"))
@@ -192,7 +199,7 @@ def main():
     summary = {
         "task": args.task, "episode": args.episode, "language": language, "language_original": manifest["language"],
         "build": build,
-        "motion": args.motion, "placement": args.placement, "status": status,
+        "motion": args.motion, "placement": args.placement, "in_release": args.in_release, "status": status,
         "policy_finished": h.finished,
         "success": success, "success_step": success_step,
         "cap": {"control_s": args.cap_control_s, "calls": args.cap_calls,

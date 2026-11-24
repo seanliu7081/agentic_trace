@@ -5,10 +5,12 @@ harness's safety terms, calls TRACE (imported lazily, so atrace works without it
 the sequencer's reactions:
   certified       execute with the tracking tube, the per-step guard and the contact detector; a stop on a
                   certified path is a defect: logged, re-observe, re-request once;
-  conflict        relax what the plan allowed in advance (no model call), else StageFailure("trace_conflict") so
-                  one REPAIR call carries the quote;
+  conflict        unseen space quoted: one look aimed where it binds, then (if it stays unseen) relax to slow guarded
+                  motion; other quotes: relax what the plan allowed in advance (no model call), else
+                  StageFailure("trace_conflict") so one REPAIR call carries the quote;
   not_certifiable look closer at the entity and re-request (at most 2 looks per move);
-  no_path         None: the caller's ladder tries its next candidate (a search failure, not a fact);
+  no_path         None: the caller's ladder tries its next candidate (a search failure, not a fact); last_move["why"]
+                  says why in typed form (end blocked by what, no arm posture, which joint, where the path binds);
   program_error   drop the offending language terms (reported at the next REPAIR) and re-request.
 The straight line is tried first (mode "straight"); only when it fails is CP-5's planner path computed and added
 as a seed for the full request (mode "v0" or "trace").
@@ -23,7 +25,7 @@ from traceplan.contract import TraceRequest
 
 from .body import hand_spheres, make_arm_check, make_ik_check, payload_spheres
 from .guard import StepGuard
-from .levels import LADDER, LIMITS, LIMITS_HOLDING, ZONE, can_relax, compile_terms, relax, safety_terms
+from .levels import KNOWN_SPACE, LADDER, LIMITS, LIMITS_HOLDING, ZONE, can_relax, compile_terms, relax, safety_terms
 from .motion import densify
 from .perception import mask_points
 from .sim_iface import WRIST_CAMERA
@@ -57,18 +59,21 @@ class TraceMotion:
 
     # ------------------------------------------------------------------------------------------- one segment
     def move(self, ends, tag, grip=None, finger=0.04, entity=None, approach=None, seed_goal=None, goal_near=False,
-             retreat=False):
+             retreat=False, keep_ends=None):
         """One segment to the first reachable end candidate. Returns the ExecResult of the executed certified path
         (done, dropped, or how it stopped after the one re-request), or None when nothing was certified. A retreat
-        never looks or calls the model: anything but a certificate returns None (the caller's move_line)."""
+        never looks or calls the model: anything but a certificate returns None (the caller's move_line).
+        keep_ends: how many end candidates TRACE keeps after its end test (default its own G); self.last_end is the
+        end the executed path went to."""
         from .harness import StageFailure
         h = self.h
-        looks, slow, retried, seeded = 0, False, False, False
+        looks, slow, retried, seeded, looked_unseen = 0, False, False, False, False
+        self.last_end = None
         while True:
             h.carve_robot()
             h._clear_held_ghost()              # the held object's own volume (unlabelled map remains) is no obstacle
             snap = build_snapshot(h)
-            req = self.request(snap, ends, tag, finger, entity, approach, slow, "straight")
+            req = self.request(snap, ends, tag, finger, entity, approach, slow, "straight", keep_ends)
             resp = self.plan(req, snap, finger)
             r = resp.result
             # no end survived its own check (lateral window, clearance, IK): seeds and search cannot change that
@@ -78,13 +83,14 @@ class TraceMotion:
                 if not seeded:
                     self.add_seeds(ends, finger, seed_goal, goal_near)
                     seeded = True
-                req = self.request(snap, ends, tag, finger, entity, approach, slow, self.mode)
+                req = self.request(snap, ends, tag, finger, entity, approach, slow, self.mode, keep_ends)
                 resp = self.plan(req, snap, finger)
                 r = resp.result
             if r == "certified":
                 if not self.valid(req, resp, snap):
                     self.react(req, "void_certificate")
                     continue
+                self.last_end = req.ends[resp.end_index] if resp.end_index is not None and req.ends else None
                 res = self.execute(req, resp, snap, grip, finger)
                 if res.status in ("done", "dropped") or retried:
                     return res
@@ -95,6 +101,15 @@ class TraceMotion:
             if r == "conflict":
                 terms = {t.id: t for t in req.terms}
                 if resp.quote and all(can_relax(q, terms[q["term"]]) for q in resp.quote):
+                    unseen = [q for q in resp.quote if terms[q["term"]].level in KNOWN_SPACE and q.get("at")]
+                    if unseen and not looked_unseen and not retreat and self.depth == 0:
+                        # unseen space binds: look at it first (it may well be free); only what stays unseen is then
+                        # crossed slowly with the contact detector on
+                        looked_unseen = True
+                        if self.look_unseen(unseen[0]["at"], approach):
+                            seeded = self.clear_seeds(ends)
+                            self.react(req, "look_unseen", at=unseen[0]["at"])
+                            continue
                     slow |= self.relax(resp.quote, terms)
                     self.react(req, "relax", quote=resp.quote)
                     continue
@@ -112,12 +127,69 @@ class TraceMotion:
                 self.drop(req, resp.findings)
                 self.react(req, "drop_terms", findings=resp.findings)
                 continue
-            self.react(req, "fallback" if retreat else "next_candidate", result=r)
+            why = self.why(resp)
+            if not retreat and self.depth == 0 and why.get("kind") == "path_blocked" and \
+                    why.get("thing") == "unobserved space" and (not looked_unseen or not slow):
+                # the search ended blocked by unseen space only (no formal conflict, e.g. its budget ran out): look at
+                # it first; what stays unseen is then crossed slowly (CONTACT_STAGE_PLAN 4.2.4, user decision D2)
+                if not looked_unseen and why.get("at") is not None:
+                    looked_unseen = True
+                    if self.look_unseen(why["at"], approach):
+                        seeded = self.clear_seeds(ends)
+                        self.react(req, "look_unseen", at=why["at"])
+                        continue
+                looked_unseen, slow = True, True
+                self.react(req, "relax", why=why)
+                continue
+            self.react(req, "fallback" if retreat else "next_candidate", result=r, why=why)
             h.last_move = {"tag": tag, "status": "no_path", "planner": "trace", "result": r,
-                           "request": req.request_id}
+                           "request": req.request_id, "why": why}
             return None
 
-    def request(self, snap, ends, tag, finger, entity, approach, slow, mode):
+    def why(self, resp):
+        """Typed reason of a refusal, in the terms the sequencer and System 1 can act on: which body, what it meets
+        (named object, unsegmented surface, unobserved space, table) and by how much; or which joint of the arm."""
+        h, st = self.h, resp.stats or {}
+        name = lambda at: (h.nearest_obstacle(np.asarray(at, float)[None]) or {}).get("object") if at is not None \
+            else None
+        if st.get("stage") == "terminal":
+            d = (st.get("ends_dropped") or [{}])[0]
+            if d.get("why") == "no_posture":
+                return {"kind": "no_arm_posture", "where": "at the end pose", "n_ends": len(st.get("ends_dropped"))}
+            return {"kind": "end_blocked", "body": d.get("group"), "thing": name(d.get("at")),
+                    "overlap_mm": round(-1e3 * float(d.get("clearance", 0.0)), 1),
+                    "n_ends": len(st.get("ends_dropped") or [])}
+        arm = st.get("arm")
+        rows = [r for r in (resp.report or []) if r.get("role") != "prefer" and r.get("max_violation", 0) > 1.0]
+        if rows:
+            r = max(rows, key=lambda r: r["max_violation"])
+            unseen = r.get("level") in KNOWN_SPACE
+            out = {"kind": "path_blocked", "term": r["term"], "at_t": round(float(r.get("at_t", 0.0)), 2),
+                   "short_mm": round(1e3 * (float(r.get("r_max", 0.0)) - float(r.get("sigma", 0.0))), 1),
+                   "thing": "unobserved space" if unseen else name(r.get("at")), "at": r.get("at")}
+            if arm:
+                out["arm"] = {k: arm.get(k) for k in ("reason", "at_t", "detail")}
+            return out
+        if arm:
+            return {"kind": "arm", "reason": arm.get("reason"), "at_t": arm.get("at_t"), "detail": arm.get("detail")}
+        return {"kind": "no_path", "stage": st.get("stage"), "budget_exhausted": st.get("budget_exhausted")}
+
+    def look_unseen(self, at, approach=None):
+        """One look aimed at unseen space where a request binds (from above, else along the approach); True when the
+        map was refreshed. Never nested inside another look."""
+        h = self.h
+        self.depth += 1
+        try:
+            fr = h.look_at_point(np.asarray(at, float), approach)
+        finally:
+            self.depth -= 1
+        h.log("look_unseen", at=np.asarray(at, float), ok=fr is not None)
+        if fr is None:
+            return False
+        h.rebuild_map(h.frames[-8:])
+        return True
+
+    def request(self, snap, ends, tag, finger, entity, approach, slow, mode, keep_ends=None):
         h = self.h
         self.n += 1
         holding = entity_of(h, h.held) if h.held is not None else None
@@ -133,7 +205,8 @@ class TraceMotion:
         return TraceRequest(f"{self.n:04d}_{tag}", snap.version, self.n, self.budget_ms, Rs, ps, h.rb.q()[:7].copy(),
                             float(finger), holding, ends, terms, bodies, LADDER,
                             LIMITS_HOLDING if holding is not None else LIMITS, mode=mode, zone=ZONE,
-                            meta={"tag": tag, "stage": st["id"] if st else None, "phase": phase})
+                            meta={"tag": tag, "stage": st["id"] if st else None, "phase": phase,
+                                  **({"keep_ends": int(keep_ends)} if keep_ends else {})})
 
     def plan(self, req, snap, finger):
         h = self.h
@@ -162,7 +235,8 @@ class TraceMotion:
         h.log("trace_result", id=req.request_id, result=resp.result, stage=st.get("stage"), solve_ms=st.get("solve_ms"),
               wall_ms=round(ms, 1), tube_mm=(resp.valid_while or {}).get("tube_mm"), standoff=resp.standoff,
               end_index=resp.end_index, quote=resp.quote, look_at=resp.look_at, findings=resp.findings,
-              closed_by_contact=st.get("closed_by_contact"))
+              closed_by_contact=st.get("closed_by_contact"), ends_dropped=st.get("ends_dropped") or None,
+              arm=st.get("arm"), end_unseen=st.get("end_unseen"))
         if self.true_scene_hook is not None:
             self.true_scene_hook(req.request_id)
         return resp

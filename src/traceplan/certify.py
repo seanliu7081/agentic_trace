@@ -31,7 +31,8 @@ def certify(obj, theta_1, req, cand, arm_check, n=128):
         cert["reason"] = "terms:" + ",".join(bad)
         return False, cert
     arm = arm_check(rep["R"], rep["p"], rep["ts"], q_reference(rep["p"], req.start_q, cand))
-    cert["arm"] = {"ok": arm.ok, "reason": arm.reason, "at_t": arm.at_t, "min_clearance": arm.min_clearance}
+    cert["arm"] = {"ok": arm.ok, "reason": arm.reason, "at_t": arm.at_t, "min_clearance": arm.min_clearance,
+                   "detail": getattr(arm, "detail", None)}
     if not arm.ok:
         cert["reason"] = f"arm:{arm.reason}"
         return False, cert

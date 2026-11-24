@@ -30,6 +30,8 @@ objects: every object the task involves.
     ["stove knob", "knob"]). Brand names alone are not recognised.
   - x, y: integer pixel in IMAGE 1 ({IMG}x{IMG}, x to the right, y downward, origin top-left) on the object's
     visible surface, near the centre of its visible part. For a part, point at the part itself.
+  - image: 1 (x, y are in IMAGE 1). Only when the object cannot be seen in IMAGE 1 (hidden behind something) but can
+    be seen in IMAGE 2 (the wrist camera): 2, and x, y are a pixel of IMAGE 2 ({IMG}x{IMG}, same convention).
 
 stages: steps in execution order.
   - op "transfer": pick up `object` (a target) and place it so that relation(object, reference) holds.
@@ -96,12 +98,13 @@ TERM_SCHEMA = {
 
 OBJECT_SCHEMA = {
     "type": "object", "additionalProperties": False,
-    "required": ["id", "name", "prompts", "role", "x", "y", "part_of"],
+    "required": ["id", "name", "prompts", "role", "x", "y", "image", "part_of"],
     "properties": {
         "id": _STR, "name": _STR,
         "prompts": {"type": "array", "items": _STR},
         "role": {"type": "string", "enum": ["target", "destination", "part", "context"]},
         "x": {"type": "integer"}, "y": {"type": "integer"},
+        "image": {"type": "integer", "enum": [1, 2]},
         "part_of": _NSTR,
     },
 }
@@ -149,8 +152,9 @@ REPAIR_INSTRUCTIONS = PROGRAM_INSTRUCTIONS + """
 REPAIR MODE. System 2 could not complete the program it was given. You receive the task, the previous
 program, the ledger of stages already completed, the failure report (what failed and why, as measured
 locally), and current images. Write `diagnosis` (one or two sentences), then a NEW program covering ONLY the
-remaining work from the current scene state. You may re-point objects (new pixels in the CURRENT image 1),
-change segmenter prompts, change the reference location (place_x/place_y), the relation, or the order.
+remaining work from the current scene state. You may re-point objects (new pixels in the CURRENT image 1, or with
+image 2 in the current image 2 when the object cannot be seen in image 1), change segmenter prompts, change the
+reference location (place_x/place_y), the relation, or the order.
 Do not repeat stages the ledger reports as done unless the images show they are undone.
 Rules for the new program:
 - Only the objects the task instruction asks to move may be moved. Never add a stage that moves, pushes, parks
@@ -169,6 +173,10 @@ Rules for the new program:
   front flush with the surrounding face; otherwise how far it stands out, or how far it is turned). This measurement
   is finer than the images (a drawer 2 cm out can look closed): when it says the goal state is not reached, keep a
   stage for it. When no face worked, the segmented part may not be the piece that moves: re-point it.
+- Grasp and placement failure reports carry `cause` (what System 2 measured to fail: e.g. no grasp on the model,
+  no room for the open hand, no arm posture, the pads missed the object, the way there is blocked by a named thing)
+  and `levers` (what would change it). Base the fix on them, not on the object's size: a wrong or partial model is
+  fixed by re-pointing the object (in image 2 if the head camera cannot see it), not by pointing at a smaller part.
 - After a trace_conflict failure the report's `quote` lists the stage terms that cannot all hold for that motion,
   each with its level and the smallest relaxation, in physical units, that would make the motion feasible
   (`value` now, `needed` for feasibility). Relax them (a looser level), rescope or drop them, or change the plan.
@@ -260,11 +268,55 @@ are shown the result and can have it picked up and put again.
 why: one short sentence.
 Never output metric numbers."""
 
+_POINT_RULES_UNIFIED = f"""x, y: integer pixel in IMAGE 1 ({IMG}x{IMG}, x to the right, y downward, origin top-left) on the surface
+where the CENTRE of the held object should come to rest, as seen in the image:
+  - relation "in": the floor of the container's opening (of the named compartment) where the object should land.
+    For a container that opens at the side (a cavity behind an opening or a door, such as a microwave or an oven),
+    the floor inside it as seen through the opening, never its front panel, its top or its door.
+  - relation "on": the middle of the free part of the support's top surface (of the area the task names).
+  - "left_of" / "right_of" / "front_of" / "behind": a free spot on the table next to the reference on that side
+    (left/right = image left/right, front = lower in the image), about one object width away from it.
+  Point at the destination, never at the robot or at the object in the gripper. System 2 searches for the exact rest
+  pose around your point (clear of other things, room for the hand).
+long_side: how the held object's longest horizontal side must lie when it comes down, as a direction in IMAGE 1:
+  "left_right", "near_far" (from the camera away into the scene), "diagonal_rising" (lower left to upper right),
+  "diagonal_falling" (upper left to lower right), or "any" when its turn about the vertical does not matter. Set it
+  when the object's shape has to line up with the destination (a long object into a slot, a box onto a narrow
+  shelf); otherwise "any".
+entry: the side from which the held object can come in, when the destination is open on one side only (a cavity with
+  a roof and a front opening, a drawer under a shelf or a handle): "from_image_left", "from_image_right",
+  "from_camera_side" (from the camera toward the destination), "from_far_side"; "from_above" when it is open from
+  above, "any" when you cannot tell. System 2 checks every way in (straight down, slanted, sliding in from a side) and
+  takes the first one that is free for the hand and the object; yours is tried first."""
+
+PLACE_POSE_INSTRUCTIONS_UNIFIED = f"""You are System 1 (the planner) of a robot manipulation system: one Franka Panda arm with a
+parallel gripper at a table and a fixed HEAD camera. The gripper is holding an object, and you decide where it is put
+down. You get the task instruction, the stage being executed (the held object, the reference, the relation to reach),
+what happened in earlier attempts of this stage (if any), and IMAGE 1: the head camera now.
+System 2 looks near the point you give for a place where the object can rest on the destination (nothing else standing
+there, a free way in for the hand and the object, room for the open hand), brings it in (straight down, slanted, or
+sliding in under what is above) and opens the gripper only when the object meets its support where expected (when the stage's release is "drop" it may let go a little above the floor of the
+opening). When no place near your point works, or the object touched something else first, the earlier attempts say
+why in words: point again where that reason does not hold. After the release you are shown the result and can have
+it picked up and put again.
+{_POINT_RULES_UNIFIED}
+why: one short sentence.
+Never output metric numbers."""
+
 PLACE_POSE_SCHEMA = {
     "type": "object", "additionalProperties": False,
     "required": ["x", "y", "long_side", "why"],
     "properties": {"x": {"type": "integer"}, "y": {"type": "integer"},
                    "long_side": {"type": "string", "enum": _LONG_SIDE}, "why": _STR},
+}
+
+ENTRY_WORDS = ["from_above", "from_image_left", "from_image_right", "from_camera_side", "from_far_side", "any"]
+PLACE_POSE_SCHEMA_UNIFIED = {
+    "type": "object", "additionalProperties": False,
+    "required": ["x", "y", "long_side", "entry", "why"],
+    "properties": {"x": {"type": "integer"}, "y": {"type": "integer"},
+                   "long_side": {"type": "string", "enum": _LONG_SIDE},
+                   "entry": {"type": "string", "enum": ENTRY_WORDS}, "why": _STR},
 }
 
 PLACE_LOOK_INSTRUCTIONS = f"""You are System 1 (the planner) of a robot manipulation system. The robot has just put an object down
@@ -285,6 +337,8 @@ wrong and correct for it (for example "it landed on the rim toward the left: aim
 When done is true, x, y and long_side are null.
 evidence: one or two short sentences.
 Never output metric numbers."""
+
+PLACE_LOOK_INSTRUCTIONS_UNIFIED = PLACE_LOOK_INSTRUCTIONS.replace(_POINT_RULES, _POINT_RULES_UNIFIED)
 
 PLACE_LOOK_SCHEMA = {
     "type": "object", "additionalProperties": False,
@@ -309,6 +363,7 @@ def validate_program(prog, img_size=IMG):
     for o in objs:
         o["x"] = int(min(max(o["x"], 0), img_size - 1))
         o["y"] = int(min(max(o["y"], 0), img_size - 1))
+        o["image"] = 2 if o.get("image") == 2 else 1
         prompts = [p.strip() for p in o.get("prompts") or [] if p and p.strip()]
         if not prompts:
             prompts = [o["name"]]

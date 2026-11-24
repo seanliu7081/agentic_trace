@@ -124,13 +124,18 @@ def trilinear_np(snap, grid, pts):
     return np.where(pts[:, 2] >= snap.origin[2] + grid.shape[2] * snap.res, CFG["open_air"], val)
 
 
-def exact_distance(snap, pts, exclude=()):
-    """Distance (m) of points (N,3) to the scene's solid geometry, table plane excluded: the harness's exact near
-    field when the snapshot carries one, else the trilinear grid value."""
+def exact_distance(snap, pts, exclude=(), unknown=False):
+    """Distance (m) of points (N,3) to the scene's solid geometry (observed or inferred), table plane excluded; with
+    unknown=True also to unseen space. The harness's exact near field when the snapshot carries one, else the
+    trilinear grid value. Safety clearance uses the observed geometry only: unseen space has its own (relaxable)
+    terms, so a pose next to it is looked at first and then crossed slowly, never refused outright."""
     pts = np.asarray(pts, float).reshape(-1, 3)
     if snap.exact is not None:
-        return np.asarray(snap.exact(pts, tuple(exclude)), float)
-    return trilinear_np(snap, sdf_grid(snap, tuple(exclude)), pts)
+        return np.asarray(snap.exact(pts, tuple(exclude), bool(unknown)), float)
+    d = trilinear_np(snap, sdf_grid(snap, tuple(exclude)), pts)
+    if unknown:
+        d = np.minimum(d, trilinear_np(snap, sdf_grid(snap, tuple(exclude), unknown=True), pts))
+    return d
 
 
 def field_distance(snap, spec, pts):

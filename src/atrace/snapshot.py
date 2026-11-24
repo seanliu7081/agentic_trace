@@ -70,8 +70,11 @@ def build_snapshot(h, version_key=None, cfg=PERCEPTION):
     labels = {e.id: e.label for e in entities.values()}
     checker = h.checker
 
-    def exact(pts, exclude=()):
-        return checker.point_clearance(np.asarray(pts, float), tuple(labels[e] for e in exclude) + held)
+    def exact(pts, exclude=(), unknown=True):
+        # unknown: unseen space counts as an obstacle (the guard's and TRACE's safety terms pass False: observed
+        # geometry only; unseen space is a relaxable require term, crossed slowly after a look)
+        return checker.point_clearance(np.asarray(pts, float), tuple(labels[e] for e in exclude if e in labels) + held,
+                                       unknown=unknown)
 
     h._snap_version = getattr(h, "_snap_version", 0) + 1
     snap = SceneSnapshot(h._snap_version, scene.lo.copy(), scene.res, occ, unknown,

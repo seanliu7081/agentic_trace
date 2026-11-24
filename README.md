@@ -68,7 +68,7 @@ free; use `--gpu 0` when GPU 7 is held.
 #   --trace-device cuda:0
 #   --compiles N                  N-1 extra low-effort PROGRAM calls for term confidence (off by default)
 #   --true-scene                  evaluator-only: save the true scene at every request (certificate honesty)
-#   --placement ladder | v1 | v2  how a held object is put down (see "Placement modes"); default ladder
+#   --placement ladder | v1 | v2 | unified  how a held object is put down (see "Placement modes"); default ladder
 
 # dev scene, no model calls (S1 program from the stub)
 .venv/bin/python scripts/dev_episode.py --gpu 0 --motion trace --suite libero_object \
@@ -131,6 +131,66 @@ All three share the grasp, the transit (TRACE) and the release; they differ in h
     destination, and accepts the release unjudged (VERIFY decides at the end).
   - The descent is vertical only, so a destination that must be entered from the side cannot be reached.
   - Parking a held object on the table still uses the careful planner.
+- **`unified`: the contact stage of `CONTACT_STAGE_PLAN.md` (M1-M3, 2026-11-23)** (`contact.py`,
+  `ContactMixin.place_object_unified`). System 1 points at the surface where the object's centre should rest
+  (`place_pose`, unified wording). System 2 searches rest poses around that point from all observed geometry
+  (`rest_poses`: on what is under the footprint, nothing standing inside it, walls around it for "in", no overhang
+  on the way down, the open hand clear, an arm posture it can leave), hands TRACE the set as ends that slide back to
+  where its end test passes, lowers the object with an expected contact window, and opens the gripper only when the
+  object meets its support inside that window (a "drop": over the opening, within a 12 cm fall). An early contact is
+  marked as geometry and the next rest pose is tried without a model call. After the release: the hand-empty test and
+  re-localisation of the object's known shape (no new segmentation), then System 1 judges (`place_look`).
+  M4 (direction, 2026-11-23):
+  - the support is read at the pointed level (surfaces higher than the pointed surface + the object's height + 3 cm
+    are not supports: a roof, a shelf or a handle above the spot); "in" is decided by the destination's walls (in 6 of
+    8 directions the first surface rising above the object's bottom, at any distance up to 30 cm, is the
+    destination's: its label, its parts, its fixture, unlabelled surface connected to it, or inside its footprint
+    hull; a roof counts); "on" by the footprint share: at least 60 % of the object's footprint cells over the
+    destination's own surface (inside its outline, standing out from the table, not another object's surface; its
+    labels decide only without an outline or for a destination too flat to stand out); a footprint whose support
+    varies by more than half the object's
+    height (a wall top, a rim edge) is rejected before the 3D checks, which are spread over the hand's turns (12 when
+    the long side does not matter);
+  - the release opens as wide as the surroundings allow (as `release_width`), and a "place" may let go up to 3 cm
+    above the rest when the hand is not clear lower;
+  - the entry is searched (`entry_search`): straight down, a 45-degree line, or a slide (down in front, in at 2-3.5 cm
+    above the rest, then the set-down; only through the spot's open sides, the hint and the arm's side), for hand
+    and object together on observed geometry; the arm needs a posture
+    along the whole entry with 6 mm clearance (`_entry_posture`, which also names what the arm would meet). The
+    put-down runs the entry as guarded legs (no contact expected) and the last one with its contact window; after the
+    release the hand leaves along the reverse of its approach (a side grasp) and back out along the entry;
+  - System 1 may say from which side the object comes in (`entry`, unified place-pose answer); it is tried first;
+  - grasps from any direction (`manip.side_grasp_candidates`: the cloud turned so that a horizontal or 45-degree
+    direction is up, the top-down generator there, picks spread over the object) when no top-down grasp fits or has
+    a posture (every placement mode);
+  - look-ahead before the grasp of a transfer (`lookahead_grasp`): System 1's place-pose call is made before the
+    grasp (no extra call); a spot not seen well enough is looked at first (level with it from its open side when
+    something is above it); when no top-down grasp has a put-down there, a side grasp that has one is taken (the
+    hand lowest first, never from below);
+  - regrasp (user decision D3, `plan_regrasp`): when the grasp held has no way in, the object is set down at a staging
+    spot (where it was taken from) turned so that a grasp with a put-down can be taken, and taken again;
+  - making room (user decision D4, `make_room`): when the rest-pose search or TRACE names a part of a fixture (a
+    door, a drawer) as what is in the way, the object is set down, the part is moved to its open end stop with the
+    general actuation, and the object is taken again (once per stage).
+
+Shared by every mode since the M1-M3 build (CONTACT_STAGE_PLAN.md):
+- the hand-off is a set (contact pose, its 180-degree twin, alternative grasps or turns) whose ends TRACE slides back
+  to where its end test passes (`search.end_test`, one rule for TRACE and the harness); refusals carry a typed reason
+  (`last_move["why"]`: end blocked by what, no arm posture, which joint, where the path binds);
+- unseen space is not a safety obstacle: a request blocked by it looks there first, then crosses it slowly
+  (user decision D2); the guard and the arm check use observed geometry, unseen space only slows the arm;
+- departures (lift, release lift, back-offs) are guarded lines until the hand clears the scene by the transit
+  margins, TRACE when the line has no posture; no unguarded fallback;
+- free space seen once is remembered across map rebuilds; the inferred fill under an object never overwrites seen
+  free space; a released object's solid is inserted whole; a model never absorbs another tracked object;
+- grasps: up to three distinct feasible grasps per attempt, postures away from joint limits with a feasible lift, the
+  closed width must match the predicted one (-6..+10 mm) before lifting, and a failed contact region and approach are
+  excluded on the next attempt;
+- strokes (push / pull): continuation in contact (re-seat and push on, no new transit), a measured state that
+  contradicts the hand's travel is not accepted, two strokes without progress end the face, a press replaces a grip
+  that closed on nothing, what lies in a moving part moves with it, and a handle is operated as the part it moves with;
+- System 1 may point at an object in the wrist image (`image: 2`) when the head camera cannot see it (user decision
+  D6); failure reports carry `cause` and `levers`.
 
 ## Where each part of the integration doc lives
 

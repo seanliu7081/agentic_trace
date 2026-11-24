@@ -157,7 +157,9 @@ class EndCandidate:
     (R, p) is the contact pose when `approach` is given (grasp / place / press pose) and the segment then ends at
     a standoff before it: p_end = p - standoff * approach. standoff "auto" = computed by TRACE from the entity's
     uncertainty along `approach`, the tracking tube and the guard distance (TRACE integration.md, "Where the
-    boundary sits"); a number = fixed; 0 = the segment ends at (R, p) itself. `window` (m) is the lateral
+    boundary sits"); a number = fixed; 0 = the segment ends at (R, p) itself; (s_min, s_max) = slide: the hand-off
+    sits where certification ends, i.e. the smallest standoff from max(auto, s_min) up to s_max (1 cm steps) whose
+    end pose passes the end test (search.end_test) and has an arm posture; the guarded move covers the rest. `window` (m) is the lateral
     tolerance of the contact pose (perpendicular to approach): when perception plus tracking error exceed it the
     end is "not certifiable with this perception" (look closer). q: arm configuration at (R, p) (posture target of
     the arm rollout). q_path/p_path/R_path: an optional seed path (e.g. from an existing joint-space planner),
@@ -216,6 +218,7 @@ class ArmResult:
     at_t: float | None = None      # path parameter of the first failure
     min_clearance: float | None = None
     clearance: np.ndarray | None = None   # (N,) per-sample arm clearance minus margin (for retiming), optional
+    detail: dict | None = None            # typed reason: {"joint", "q"} | {"at", "clearance"} | {"err_p", "err_r"}
 
 # arm_check(R (N,3,3), p (N,3), s (N,) path parameter in [0,1], q_ref (N,7)) -> ArmResult
 # ik_check(R (3,3), p (3,), q_seed (7,) | None) -> (ok: bool, q: (7,) | None)          (free ends only)
@@ -248,7 +251,9 @@ class TraceResponse:
     quote: list | None = None      # conflict: [{term, prim, level, relax_to, param, value, needed, unit}]
     look_at: dict | None = None    # not_certifiable: {entity, term, uncertainty, tolerance, axis}
     findings: list | None = None   # program_error: [{test, term, detail}]
-    stats: dict = field(default_factory=dict)    # {stage: fast_path|search|seed, solve_ms, certify_ms, evals, ...}
+    stats: dict = field(default_factory=dict)    # {stage: fast_path|search|seed, solve_ms, certify_ms, evals, ...,
+    #   ends_dropped: [{end, why: "blocked"|"no_posture", group, clearance, at}], arm: last arm-check refusal,
+    #   end_unseen: {group, depth, at} when the chosen end overlaps unseen space}
 
 
 # ----------------------------------------------------------------------------------------------- utils

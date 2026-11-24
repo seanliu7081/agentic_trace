@@ -58,8 +58,11 @@ def quote_entry(term, row):
     else:
         value = term.args.get("param0", term.args[param])
         needed = value + spec.sign * row["r_max"]
-    return {"term": term.id, "prim": term.prim, "level": term.level, "relax_to": term.relax_to, "param": param,
-            "value": value, "needed": needed, "unit": unit}
+    out = {"term": term.id, "prim": term.prim, "level": term.level, "relax_to": term.relax_to, "param": param,
+           "value": value, "needed": needed, "unit": unit}
+    if row.get("at_x") is not None:                       # where the term binds (the caller can look there)
+        out["at"] = np.round(np.asarray(row["at_x"], float), 4).tolist()
+    return out
 
 
 def nearest_entity(snap, x):

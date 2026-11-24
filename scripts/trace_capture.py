@@ -223,7 +223,9 @@ def _why_dropped(c, snap, bodies, holding, ik_check):
     return "no IK solution at the end pose", float(clear.min())
 
 
-def rec_score(cands, snap, bodies, start, holding, ik_check, G):
+def rec_score(cands, snap, bodies, start, holding, ik_check, G, dropped=None):
+    # dropped: the planner's own list (score_candidates gained it after this tool was written); only the real call
+    # below fills it, the per-candidate probes do not
     with _Hook():
         info = []
         for c in cands:
@@ -234,7 +236,7 @@ def rec_score(cands, snap, bodies, start, holding, ik_check, G):
             if not kept1:
                 d["reason"], d["clear"] = _why_dropped(c, snap, bodies, holding, ik_check)
             info.append(d)
-    out = ORIG["score"](cands, snap, bodies, start, holding, ik_check, G)
+    out = ORIG["score"](cands, snap, bodies, start, holding, ik_check, G, dropped)
     with _Hook():
         kept = [int(c.index) for c in out]
         for d in info:

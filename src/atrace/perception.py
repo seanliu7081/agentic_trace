@@ -379,6 +379,22 @@ class SceneMap:
         self._touch()
         return removed
 
+    def add_surface(self, pts):
+        """Observed surface points from touch (a contact the cameras did not show): into the surface cloud and as
+        occupied, unlabelled voxels."""
+        pts = np.asarray(pts, float).reshape(-1, 3)
+        idx = self.index(pts)
+        ok = self.inside(idx)
+        if not ok.any():
+            return
+        self._chunks.append(voxel_down(pts[ok], 0.003))
+        self.cloud_version += 1
+        self.merge_cloud()
+        ii = tuple(idx[ok].T)
+        self.state[ii] = OCC
+        self.skin[ii] = True
+        self._touch()
+
     def clear_label(self, oid):
         sel = (self.label == oid) | (self.shadow == oid)
         self.state[sel] = FREE
@@ -386,8 +402,14 @@ class SceneMap:
         self.shadow[sel] = 0
         self._touch()
 
-    def insert_object(self, obj: ObjectModel):
-        """Insert an object model's solid (surface points + 2.5D fill) with its label."""
+    def insert_object(self, obj: ObjectModel, seen_free=None, force=False, hollow=False, shell=0.02):
+        """Insert an object model's solid (surface points + 2.5D fill) with its label. The fill below the observed
+        surface is an inference: it never overwrites space a camera saw free (now: FREE in this map; earlier:
+        seen_free, the remembered free space), so a cavity under a roof that a camera has looked into stays free.
+        force: the object has just been put there (released): its whole solid is occupied whatever was seen before.
+        hollow: a container (something is put in it): the fill is only a wall's thickness (`shell`) below its
+        observed surface; the unseen space its walls and roof enclose stays as it was (unknown until a camera looks
+        in), not inferred solid."""
         pts = obj.points
         if len(pts) == 0:
             return
@@ -406,6 +428,17 @@ class SceneMap:
         if ins.any():
             idx2 = self.index(sub[ins])
             idx2 = idx2[self.inside(idx2)]
+            if hollow and not force and len(idx2):
+                kt = np.full(self.shape[:2], -1, int)            # the observed surface's top voxel per column
+                np.maximum.at(kt, (idx[:, 0], idx[:, 1]), idx[:, 2])
+                depth = kt[idx2[:, 0], idx2[:, 1]] - idx2[:, 2]
+                idx2 = idx2[(depth >= 0) & (depth <= max(1, int(round(shell / self.res))))]
+            if not force:
+                ii = (idx2[:, 0], idx2[:, 1], idx2[:, 2])
+                keep = self.state[ii] != FREE
+                if seen_free is not None:
+                    keep &= ~seen_free[ii]
+                idx2 = idx2[keep]
             self.state[idx2[:, 0], idx2[:, 1], idx2[:, 2]] = OCC
             self.label[idx2[:, 0], idx2[:, 1], idx2[:, 2]] = obj.oid
         self._touch()
@@ -673,6 +706,23 @@ class NearField:
                 keep[cand[np.isfinite(dq) & (self.lab[cand] == 0)]] = False
         pts = self.cloud[keep]
         ct = cKDTree(pts) if len(pts) else None
+        if free_near:
+            # ... and so does the space hugging them that no surface explains (occluded / unlabelled voxels): a point
+            # in such a voxel is not inside an obstacle
+            cubes = cubes.copy()
+            for q, r, _ in free_near:
+                q = np.asarray(q, float)
+                if len(q) == 0:
+                    continue
+                a = np.clip(scene.index(q.min(0) - r), 0, np.array(scene.shape) - 1)
+                b = np.clip(scene.index(q.max(0) + r), 0, np.array(scene.shape) - 1)
+                sub = cubes[a[0]:b[0] + 1, a[1]:b[1] + 1, a[2]:b[2] + 1]
+                cid = np.argwhere(sub)
+                if len(cid):
+                    cen = scene.lo + (cid + a + 0.5) * scene.res
+                    dq, _ = cKDTree(q).query(cen, distance_upper_bound=r + 0.5 * scene.res)
+                    hit = cid[np.isfinite(dq)]
+                    sub[hit[:, 0], hit[:, 1], hit[:, 2]] = False
         full = cubes
         # only boundary cubes can be nearest to a point outside the unknown region (inside ones: distance 0)
         cubes = cubes & ~ndimage.binary_erosion(cubes, structure=np.ones((3, 3, 3), bool), border_value=1)

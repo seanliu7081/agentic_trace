@@ -92,7 +92,7 @@ def exact_from(snap):
     """exact(points, exclude) of a (saved) true snapshot: KD-tree distance to the entities not excluded."""
     trees = {k: cKDTree(e.points) for k, e in snap.entities.items() if len(e.points)}
 
-    def exact(pts, exclude=()):
+    def exact(pts, exclude=(), unknown=False):          # the true scene has no unseen space
         d = [t.query(np.asarray(pts, float))[0] for k, t in trees.items() if k not in exclude]
         return np.min(d, 0) if d else np.full(len(pts), np.inf)
     return exact

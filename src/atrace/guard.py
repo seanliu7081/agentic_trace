@@ -10,8 +10,8 @@ the arm exerts on the hand) growing along the predicted step while the hand fall
 does both within its first step (15-27 N and 0.2-0.5 mm in the dev-scene descents); leaving a jammed contact also
 raises the force along the motion (20-30 N measured) but the hand keeps to the prediction (-0.03 mm).
 
-StepGuard: on a certified path, robot and payload clearance on the snapshot's exact geometry against the guard
-distances alone (the ladder's bottom rung), with the certificate's "do not get closer" zones, plus joint limits.
+StepGuard: on a certified path, robot and payload clearance on the snapshot's exact (observed) geometry against the
+guard distances alone (the ladder's bottom rung), with the certificate's "do not get closer" zones, plus joint limits.
 """
 from __future__ import annotations
 
@@ -114,14 +114,19 @@ class StepGuard:
         self.at_ends = [self._clear(R, p, q) for R, p, q in ((timed.R[0], timed.p[0], timed.q[0]),
                                                             (timed.R[-1], timed.p[-1], timed.q[-1]))]
 
+    def _exact(self, x):
+        """Observed geometry only: unseen space is crossed slowly with the contact detector on (DESIGN §3.4 as changed
+        by CONTACT_STAGE_PLAN 4.2.4), so the guard must not stop a certified slow crossing at its border."""
+        return self.exact(x, (), False)
+
     def _clear(self, R, p, q):
         """Group -> (scene clearance, table clearance) at one pose (spheres) and joint configuration (arm)."""
         x = p + self.c @ R.T
-        cs = self.exact(x) - self.r
+        cs = self._exact(x) - self.r
         zs = x[:, 2] - self.tz - self.r
         out = {n: (cs[self.g == GROUPS.index(n)].min(), zs[self.g == GROUPS.index(n)].min()) for n in self.names}
         W = self.rm.points_world(self.rm.full_q(np.asarray(q, float)[None, :7]), groups=[0])[0]
-        out["arm"] = ((self.exact(W) - self.pr).min(), (W[:, 2] - self.tz - 0.5 * self.pr).min())
+        out["arm"] = ((self._exact(W) - self.pr).min(), (W[:, 2] - self.tz - 0.5 * self.pr).min())
         return out
 
     def check(self, q):

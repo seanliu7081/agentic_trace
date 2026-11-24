@@ -23,10 +23,11 @@ from .objective import LEVELS, Objective
 from .program import Program, fuse, lint, run_program_tests
 from .scene import field_distance
 from .search import CFG as SEARCH
-from .search import Cand, continuation, free_end_candidates, path_seeds, score_candidates
+from .search import Cand, continuation, end_test, free_end_candidates, path_seeds, score_candidates
 from .spline import SE3Spline
 
 CFG = {"device": "cuda:0" if torch.cuda.is_available() else "cpu", "n_dense": 128, "z": 1.64, "search": {}}
+FAST_PATH_ENDS = 4          # straight lines certified per request (the kept ends, best first)
 
 
 class TraceService:
@@ -65,7 +66,18 @@ class TraceService:
 
 
 def _clean(rows):
-    return [{k: v for k, v in r.items() if k != "at_x"} for r in rows]
+    """Report rows for the response: the worst sphere position stays (as "at"), so the caller can name what blocks."""
+    out = []
+    for r in rows:
+        row = {k: v for k, v in r.items() if k != "at_x"}
+        if r.get("at_x") is not None:
+            row["at"] = np.round(np.asarray(r["at_x"], float), 4).tolist()
+        out.append(row)
+    return out
+
+
+def _jsonable_test(d):
+    return {k: (np.round(np.asarray(v, float), 4).tolist() if k == "at" else v) for k, v in d.items()}
 
 
 class _Plan:
@@ -81,6 +93,7 @@ class _Plan:
         self.gen = torch.Generator().manual_seed(req.seed)       # CPU draws: identical noise on any device
         self.stats = {"stage": None, "certify_ms": 0.0, "evals": 0, "seeds": 0, "levels_run": 0,
                       "candidates_tried": 0, "budget_exhausted": False}
+        self.dropped = []                                         # ends that left before any search, and why
         self.start = {"R": np.asarray(req.start_R, float), "p": np.asarray(req.start_p, float)}
         self.levels = [dict(L, K=k) for L, k in zip(LEVELS, self.cfg["k_schedule"])]
         self.allow = req.meta.get("allow_contact", [])
@@ -115,15 +128,50 @@ class _Plan:
     def candidate(self, i, e):
         a = None if e.approach is None else np.asarray(e.approach, float) / np.linalg.norm(e.approach)
         s, flag, extra = 0.0, None, []
+        slide = tuple(e.standoff) if isinstance(e.standoff, (tuple, list)) else None
         if a is not None:
-            s = auto_standoff(a, e.entity, self.snap, self.req.margins) if e.standoff == "auto" else float(e.standoff)
+            auto = e.standoff == "auto" or slide is not None
+            s = auto_standoff(a, e.entity, self.snap, self.req.margins) if auto else float(e.standoff)
+            if slide is not None:
+                s = max(s, float(slide[0]))
             if e.window is not None:
                 flag = window_flag(a, e.entity, e.window, self.snap, self.req.margins)
                 extra = [end_window_term(a, e.window, e.entity)]
         R, p = np.asarray(e.R, float), np.asarray(e.p, float) - (0.0 if a is None else s * a)
-        c = Cand(i, R, p, None if e.q is None else np.asarray(e.q, float), a, s, e.entity, e.window, e, flag=flag)
+        q = None if e.q is None else np.asarray(e.q, float)
+        test, ik_done = None, False
+        if slide is not None and a is not None:
+            s, p, q, test, ik_done = self.slide(e, R, a, s, float(slide[1]), q)
+        c = Cand(i, R, p, q, a, s, e.entity, e.window, e, flag=flag)
+        c.test, c.ik_done = test, ik_done
         c.program, c.flags = self.program(list(self.req.terms) + extra, c.end())
         return c
+
+    def slide(self, e, R, a, s0, s_max, q):
+        """The hand-off sits where certification ends: from the contact pose back along the approach, the first
+        standoff (1 cm steps) whose end pose passes the end test and has an arm posture. Returns (s, p, q, test,
+        ik_done); when none passes, the last test (the caller's terminal screen drops the end with its reason)."""
+        held = (self.req.holding,) if self.req.holding else ()
+        test, last, ik_tries, next_ik = None, None, 0, -np.inf
+        for s in np.arange(s0, s_max + 1e-9, 0.01):
+            p = np.asarray(e.p, float) - s * a
+            test = end_test(self.snap, self.req.bodies, R, p, held, e.entity, contact=True)
+            if last is None or not last[3].get("no_posture"):
+                last = (float(s), p, q, test, False)
+            if not test["ok"] or s < next_ik - 1e-9:
+                continue
+            if self.ik is None:
+                return float(s), p, q, test, False
+            ok, q_s = self.ik(R, p, q)
+            if ok:
+                return float(s), p, q_s, test, True
+            # no posture here: two more tries, 4 cm further back each (IK is the costly part of the slide)
+            last = (float(s), p, q, dict(test, ok=False, no_posture=True), False)
+            ik_tries += 1
+            if ik_tries >= 3:
+                break
+            next_ik = s + 0.04
+        return last
 
     # ------------------------------------------------------------------ helpers
     def objective(self, c, K):
@@ -135,12 +183,17 @@ class _Plan:
         t = time.perf_counter()
         out = certify(obj, th, self.req, c, self.arm, self.n_dense)
         self.stats["certify_ms"] += (time.perf_counter() - t) * 1e3
+        arm = out[1].get("arm")
+        if not out[0] and arm is not None and not arm.get("ok"):
+            self.stats["arm"] = {k: v for k, v in arm.items() if k != "ok"} | {"end": c.index}
         return out
 
     def certified(self, c, sp, th, cert, stage):
         self.stats["stage"] = stage
         if c.closed:
             self.stats["closed_by_contact"] = c.closed
+        if getattr(c, "unseen", None):
+            self.stats["end_unseen"] = _jsonable_test(c.unseen)
         tm = cert["timed"]
         return self.resp("certified", timed=tm, spline=sp.to_dict(th), end_index=c.index, end_R=c.R, end_p=c.p,
                          standoff=c.standoff, report=_clean(cert["report"]),
@@ -188,13 +241,15 @@ class _Plan:
         if flagged and not cands:
             self.stats["stage"] = "terminal"
             return self.resp("not_certifiable", look_at=flagged[0].flag)
-        cands = score_candidates(cands, snap, req.bodies, self.start, req.holding, self.ik, self.cfg["G"])
+        keep = int(req.meta.get("keep_ends", self.cfg["G"]))
+        cands = score_candidates(cands, snap, req.bodies, self.start, req.holding, self.ik, keep, self.dropped)
+        self.stats["ends_dropped"] = [_jsonable_test(d) for d in self.dropped]
         if not cands:
             self.stats["stage"] = "terminal"
             return self.resp("no_path")
 
         best = None                                   # (cand, obj, spline, theta, rows) of the best failure
-        for c in cands:                               # fast path: certify the straight line
+        for c in cands[:FAST_PATH_ENDS]:              # fast path: certify the straight line
             obj, sp = self.objective(c, self.levels[0]["K"])
             th = sp.straight_theta()
             ok, cert = self.certify(obj, th, c)
@@ -219,6 +274,9 @@ class _Plan:
 
         searched = None
         warm = req.meta.get("warm_spline")
+        # the search gets the whole budget: screening a set of hand-off ends (end test, slide, arm postures) and their
+        # straight lines must not starve it (a set of ends is the point of the hand-off, CONTACT_STAGE_PLAN 4.2)
+        self.deadline = time.perf_counter() + req.budget_ms / 1e3
         for k, c in enumerate(cands):
             if k and time.perf_counter() >= self.deadline:     # the first candidate certifies at least its seeds
                 self.stats["budget_exhausted"] = True

@@ -21,20 +21,24 @@ from traceplan.contract import EndCandidate
 
 from . import articulate
 from .body import ControllerModel
+from .contact import ContactMixin
 from .guard import ContactDetector
 from .snapshot import entity_of
 from .tracemotion import TraceMotion
+from .levels import LADDER, tube as _tube
 from .geometry import frame_from_axes, rot_z, rotvec_to_mat, top_down_rotation, mat_to_rotvec
 from .llm import AstraError, image_part, text_part
 from . import manip
 from .manip import (container_region, grasp_candidates, outline, placement_candidates, preshape_finger,
                     reserve_space, soft_candidates, support_region, _wrap_pi, set_gripper_geometry)
 from .motion import Attached, Checker, Executor, Planner, densify
-from .perception import (OCC, ObjectModel, SceneMap, estimate_table_z, grow_region, hull_surface_samples, mask_points,
-                         project_mask, voxel_down)
+from .perception import (FREE, OCC, UNKNOWN, ObjectModel, SceneMap, estimate_table_z, grow_region,
+                         hull_surface_samples, mask_points, project_mask, voxel_down)
 from scipy.spatial import cKDTree
 from .program import (EFFECT_INSTRUCTIONS, EFFECT_SCHEMA, IMG, PLACE_LOOK_INSTRUCTIONS, PLACE_LOOK_SCHEMA,
-                      PLACE_POSE_INSTRUCTIONS, PLACE_POSE_SCHEMA, PROGRAM_INSTRUCTIONS, PROGRAM_SCHEMA,
+                      PLACE_LOOK_INSTRUCTIONS_UNIFIED, PLACE_POSE_INSTRUCTIONS, PLACE_POSE_INSTRUCTIONS_UNIFIED,
+                      PLACE_POSE_SCHEMA, PLACE_POSE_SCHEMA_UNIFIED,
+                      PROGRAM_INSTRUCTIONS, PROGRAM_SCHEMA,
                       REPAIR_INSTRUCTIONS, REPAIR_SCHEMA, VERIFY_INSTRUCTIONS, VERIFY_SCHEMA, ProgramError,
                       merge_compiles, validate_program)
 from .sim_iface import HEAD_CAMERA, WRIST_CAMERA
@@ -52,6 +56,13 @@ NEAR = {"arm": 0.008, "palm": 0.008, "finger": 0.004, "payload": 0.004,
 TIER_SCALE = (1.0, 0.5, 0.5, 0.0)
 # placement "v2": at most this many put-downs per stage call before the stage fails over to REPAIR
 V2_TRIES = 4
+# a grasp's fingertips may touch the support under the object (fingertip clearance is closed by contact), the rest of
+# the hand keeps NEAR: one ordered tolerance chain from the generator (TIP_CLEAR) through IK to the configuration check
+GRASP_NEAR = {**NEAR, "plane_finger": 0.0}
+FLIP = np.diag([-1.0, -1.0, 1.0])     # the gripper's 180-degree twin about its approach axis (pads are symmetric)
+DEPART_MAX = 0.20                     # m: a departure goes at most this far before TRACE takes over
+GRASP_JOINT_SLACK = 0.08              # rad: a grasp posture keeps this far from every joint limit (the lift starts there)
+SLIDE = (0.03, 0.30)                  # m: hand-off search range above a put-down's contact pose (TRACE slide)
 # lateral window (m) of a placement for TRACE's standoff check: CP-5's region radius of the stage's tolerance class
 PLACE_WINDOW = {"in": {"tight": 0.03, "normal": 0.06, "loose": 0.2}, "on": {"tight": 0.03, "normal": 0.05, "loose": 0.09},
                 "beside": {"tight": 0.05, "normal": 0.05, "loose": 0.05}}
@@ -64,18 +75,25 @@ class StageFailure(Exception):
         self.info = info
 
 
-class Harness:
+class Harness(ContactMixin):
     def __init__(self, robot, instruction, run_dir, astra, segmenter, max_wall_s=900.0, max_repairs=2,
                  verify=True, log_images=True, prompt_note=None, motion="trace", trace_device="cuda:0",
-                 trace_budget_ms=2000.0, compiles=1, placement="ladder"):
+                 trace_budget_ms=2000.0, compiles=1, placement="ladder", in_release=None):
+        # in_release: None = each "in" transfer releases as the program says ("place" | "drop"); "drop" / "place":
+        #   every "in" transfer uses that release, whatever the program says (a run-wide setting, all destinations).
         # placement: how a held object is put down.
         #   "ladder": the careful planner with the margin ladder (tiers 0-2); it returns nothing when no candidate
         #             passes every test.
         #   "v1":     the same planner, ranking instead of rejecting on the destination side (tier 3).
         #   "v2":     no placement planner (r1's mechanism): System 1 points, the descent ends on contact, System 1
         #             judges the result and points again.
-        assert placement in ("ladder", "v1", "v2"), placement
+        #   "unified": the contact stage of CONTACT_STAGE_PLAN.md: System 1 points, geometry finds the rest pose near
+        #             the spot, the way down carries its expected contact and the gripper opens only when it holds
+        #             (contact.py); System 1 judges the result.
+        assert placement in ("ladder", "v1", "v2", "unified"), placement
+        assert in_release in (None, "drop", "place"), in_release
         self.placement = placement
+        self.in_release = in_release
         self.rb = robot
         self.rm = robot.model
         self.instruction = instruction
@@ -169,10 +187,49 @@ class Harness:
             lab = None if labels is None else labels[i]
             self.scene.integrate(fr, lab, extra_mask=fr.meta.get("held_mask"), robot_shadow_free=self.shadow_rule(fr),
                                  held_box=fr.meta.get("held_box"))
+        self._remember_free()
         self.carve_robot()
         self._clear_held_ghost()
+        self._clear_vacated()
+        self._recall_free()
         self.scene.finalize()
         self._rec("on_map", "integrate")
+
+    # ---------------------------------------------------------------- free-space memory (scene rule 1)
+    def _remember_free(self):
+        """Free space a camera (or the robot's body) has shown stays known free across map rebuilds."""
+        mem = getattr(self, "free_mem", None)
+        if mem is None or mem.shape != self.scene.shape:
+            self.free_mem = mem = np.zeros(self.scene.shape, bool)
+        mem |= self.scene.state == FREE
+
+    def _recall_free(self):
+        """Unseen voxels of the current map that were seen free before (and nothing was put there since) are free."""
+        mem = getattr(self, "free_mem", None)
+        if mem is None or mem.shape != self.scene.shape:
+            return
+        sel = (self.scene.state == UNKNOWN) & mem
+        if sel.any():
+            self.scene.state[sel] = FREE
+            self.scene._touch()
+
+    def _forget_free(self, pts, pad=0.015):
+        """Something is (now) there: free space remembered around these points no longer holds."""
+        mem = getattr(self, "free_mem", None)
+        pts = np.asarray(pts, float).reshape(-1, 3)
+        if mem is None or len(pts) == 0:
+            return
+        a = np.clip(self.scene.index(pts.min(0) - pad), 0, np.array(mem.shape) - 1)
+        b = np.clip(self.scene.index(pts.max(0) + pad), 0, np.array(mem.shape) - 1)
+        mem[a[0]:b[0] + 1, a[1]:b[1] + 1, a[2]:b[2] + 1] = False
+
+    def _clear_vacated(self):
+        """Volumes objects were lifted out of: their unlabelled leftover (pixels outside the object's mask in frames
+        taken before the lift) is cleared again after every map rebuild; labelled objects are kept."""
+        for oid, lo, hi in getattr(self, "_vacated", []):
+            n = self.scene.clear_box(np.eye(3), np.zeros(3), lo, hi, 0.0)
+            if n:
+                self.log("vacated_cleared", object=self.objects[oid].name if oid in self.objects else oid, points=n)
 
     def _clear_held_ghost(self, margin=0.01):
         """The held object fills its own volume: what the cameras show inside its box in the hand frame (grown by
@@ -669,33 +726,119 @@ class Harness:
             raise StageFailure("dropped_in_transit")
         return res.status == "done"
 
-    def reach(self, contact_R, contact_p, q_contact, approach, entity_oid, window, tag, grip, finger, q_pre):
-        """Approach a contact pose (grasp, place, part, press). TRACE ends the segment at a computed standoff before
-        it (standoff "auto"); the caller's guarded descent covers the rest and ends on contact. CP-5: its pre-pose."""
+    def reach(self, contact_R, contact_p, q_contact, approach, entity_oid, window, tag, grip, finger, q_pre,
+              alts=(), twin=True, standoff=(0.0, 0.10)):
+        """Approach a contact pose (grasp, place, part, press). TRACE ends the segment where certification ends: from
+        its perception standoff ("auto") back along the approach until its end test passes and the arm has a posture
+        (standoff (s_min, s_max)); the caller's guarded move covers the rest.
+        The hand-off is a set, not a point: the contact pose, the gripper's 180-degree twin about the approach axis
+        (pads and closed fingertips are symmetric), and alternative contact poses `alts` (dicts R, p, q, approach,
+        window), each with its twin, ordered so the hand turns least; TRACE certifies the first it can.
+        Returns the end the hand went to (its R, p: the contact pose to go on to; .k: 0 = the given pose, i = alts[i-1];
+        .twin: True for the turned twin) or None. CP-5: its pre-pose."""
         if self.motion == "cp5":
-            return self.go_configs([q_pre], TRANSIT, grip=grip, finger=finger, tag=tag, goal_near=True)
-        a = np.asarray(approach, float)
-        e = EndCandidate(np.asarray(contact_R, float), np.asarray(contact_p, float), q=np.asarray(q_contact, float)[:7],
-                         approach=a / np.linalg.norm(a), standoff="auto", window=float(window),
-                         entity=entity_of(self, entity_oid))
-        res = self.tm.move([e], tag, grip, finger, entity=e.entity, approach=e.approach, seed_goal=q_pre,
-                           goal_near=True)
+            if not self.go_configs([q_pre], TRANSIT, grip=grip, finger=finger, tag=tag, goal_near=True):
+                return None
+            e = EndCandidate(np.asarray(contact_R, float), np.asarray(contact_p, float), q=q_contact)
+            e.k, e.twin = 0, False
+            return e
+        ent = entity_of(self, entity_oid)
+        R0, _ = self.rb.eef_pose()
+        main = {"R": contact_R, "p": contact_p, "q": q_contact, "approach": approach, "window": window}
+        ends = []
+        for k, c in enumerate([main] + list(alts)):
+            a = np.asarray(c.get("approach") if c.get("approach") is not None else np.asarray(c["R"])[:, 2], float)
+            a = a / np.linalg.norm(a)
+            R = np.asarray(c["R"], float)
+            q = None if c.get("q") is None else np.asarray(c["q"], float)[:7]
+            w = c.get("window", window)
+            grp = [(R, q, False)] + ([(R @ FLIP, None, True)] if twin else [])
+            grp.sort(key=lambda g: _turn_angle(R0, g[0]))
+            for Rg, qg, tw in grp:
+                e = EndCandidate(Rg, np.asarray(c["p"], float), q=qg, approach=a, standoff=standoff,
+                                 window=None if w is None else float(w), entity=ent)
+                e.k, e.twin = k, tw
+                ends.append(e)
+        a0 = ends[0].approach
+        res = self.tm.move(ends, tag, grip, finger, entity=ent, approach=a0, seed_goal=q_pre, goal_near=True,
+                           keep_ends=len(ends))
         if res is None:
-            return False
+            return None
         if res.status == "dropped":
             raise StageFailure("dropped_in_transit")
-        return res.status == "done"
+        if res.status != "done" or self.tm.last_end is None:
+            return None
+        e = self.tm.last_end
+        self.log("handoff", tag=tag, end=int(getattr(e, "k", 0)), twin=bool(getattr(e, "twin", False)),
+                 n_ends=len(ends))
+        return e
 
-    def retreat(self, R_goal, p_goal, grip=None, speed=0.10, finger=None, tag="retreat"):
-        """A contact-free lift or back-off: one standoff-0 TRACE segment; when TRACE does not certify it (near
-        contact) or it does not complete, CP-5's move_line (departures from contact stay the harness's)."""
+    def retreat(self, R_goal, p_goal, grip=None, speed=0.10, finger=None, tag="retreat", until_clear=True):
+        """Leave a contact (lift, back-off, lift after a release): a guarded straight line toward p_goal (the reverse
+        of the approach), continued until the hand and the held object clear the observed scene by TRACE's margins
+        (at most DEPART_MAX), so the next certified segment does not start inside them. When the line has no posture
+        or ends on contact, a certified TRACE segment to the goal; never an unguarded line. Returns an ExecResult or
+        None (nothing moved the hand there)."""
         finger = self._finger() if finger is None else finger
+        R_goal = np.asarray(R_goal, float)
+        Rs, ps = self.rb.eef_pose()
+        d = np.asarray(p_goal, float) - ps
+        dist = float(np.linalg.norm(d))
+        if dist < 1e-4:
+            return None
+        u = d / dist
+        if until_clear and self.motion != "cp5":
+            dist = self._depart_distance(R_goal, ps, u, dist, finger)
+        goal = ps + u * dist
+        # leaving a contact releases force (a press, a set-down): no force rule, only the contact detector, which
+        # checks that the hand falls behind its predicted step (a released preload does not)
+        res = self.move_line(R_goal, goal, grip=grip, speed=speed, finger=finger, guard=self._guard("contact", None),
+                             force_limit=1e9)
+        self.log("depart", tag=tag, status=None if res is None else res.status, dist=round(dist, 3))
+        if res is not None and res.status in ("done", "dropped"):
+            return res
         if self.motion != "cp5":
-            res = self.tm.move([EndCandidate(np.asarray(R_goal, float), np.asarray(p_goal, float))], tag, grip, finger,
-                               retreat=True)
-            if res is not None and res.status in ("done", "dropped"):
-                return res
-        return self.move_line(R_goal, p_goal, grip=grip, speed=speed, finger=finger)
+            res2 = self.tm.move([EndCandidate(R_goal, goal)], tag, grip, finger, retreat=True)
+            if res2 is not None and res2.status in ("done", "dropped"):
+                return res2
+        return res
+
+    def _depart_distance(self, R, p0, u, d0, finger):
+        """How far a departure goes: at least d0, then on in 1 cm steps (at most DEPART_MAX) until the hand and the
+        held object clear the observed scene and the table by TRACE's transit margins; else where they clear it
+        most."""
+        L, grp, rad = self._hand_local(finger)
+        att = self.checker.attached
+        excl = (self.held,) if self.held is not None else ()
+        tv = _tube(LADDER, LADDER["v_min"])
+        need = lambda g: LADDER["guard"][g] + tv + LADDER["perception"]
+        need_pl = lambda g: LADDER["guard_plane"][g] + tv
+        best, best_def = d0, np.inf
+        for s in np.arange(d0, max(d0, DEPART_MAX) + 1e-9, 0.01):
+            p = p0 + u * s
+            Wh = p + L @ R.T
+            c = self.checker.point_clearance(Wh, excl, unknown=False) - rad
+            zc = Wh[:, 2] - self.table_z - rad
+            deficit = max(need("palm") - c[grp == 1].min(), need("finger") - c[grp == 2].min(),
+                          need_pl("palm") - zc[grp == 1].min(), need_pl("finger") - zc[grp == 2].min())
+            if att is not None:
+                Wp = p + att.pts_site @ R.T
+                cp = self.checker.point_clearance(Wp, excl, unknown=False) - 0.004
+                deficit = max(deficit, need("payload") - cp.min(), need_pl("payload") - (Wp[:, 2] - self.table_z).min())
+            if deficit <= 0:
+                return float(s)
+            if deficit < best_def:
+                best, best_def = float(s), deficit
+        return best
+
+    def look_at_point(self, at, approach=None):
+        """A wrist view of a point a plan needs (unseen space next to a hand-off): from above, else along the
+        approach. Frame or None."""
+        at = np.asarray(at, float)
+        fr = self.look_from_above(np.r_[at[:2], max(float(at[2]), self.table_z)], height=0.28, rrt=False)
+        if fr is None and approach is not None and abs(float(np.asarray(approach)[2])) < 0.9:
+            fr = self.look_toward(at, np.asarray(approach, float), dist=0.28, allow_rrt=False)
+        return fr
 
     def _guard(self, reason, rule):
         """Guarded descents end on contact (ContactDetector with CP-5's force rule and reason kept); CP-5 alone in
@@ -769,7 +912,11 @@ class Harness:
             return None
         res = self.ex.run_path(qs, grip=grip, finger=finger, eef_v=speed, guard=guard, force_limit=force_limit,
                                drop_check=self._drop_check if self.held is not None else None)
-        self.carve_robot(qs[::3])
+        if res.status == "done":
+            self.carve_robot(qs[::3])
+        else:                       # stopped part-way: only what the arm went through holds nothing else
+            k = int(np.argmin(np.abs(qs - self.rb.q()[:7]).max(axis=1)))
+            self.carve_robot(np.r_[qs[:k + 1:3], self.rb.q()[None, :7]])
         return res
 
     # ================================================================ S1 calls
@@ -809,6 +956,7 @@ class Harness:
         data, rec = self.astra.call("repair", REPAIR_INSTRUCTIONS, content, REPAIR_SCHEMA, effort="high")
         self._tick("model_wait", t)
         self.log("repair", diagnosis=data.get("diagnosis"), record=rec, program=data)
+        self._repair_wrist = wrist
         return data, head
 
     def call_verify(self):
@@ -832,8 +980,10 @@ class Harness:
         return data
 
     # ================================================================ grounding
-    def ground(self, prog, head, frames, keep_ids=()):
-        """Create / refresh object models for the program's objects from head + wrist frames."""
+    def ground(self, prog, head, frames, keep_ids=(), s1_wrist=None):
+        """Create / refresh object models for the program's objects from head + wrist frames. An object System 1
+        pointed at in its wrist image (image 2: hidden from the head camera) is segmented there (s1_wrist: the wrist
+        frame System 1 saw)."""
         t = time.time()
         objs = prog["objects"]
         order = sorted(objs, key=lambda o: 1 if o.get("part_of") else 0)
@@ -842,9 +992,11 @@ class Harness:
         for o in order:
             sid = o["id"]
             uv = (o["x"], o["y"])
+            src = s1_wrist if (o.get("image") == 2 and s1_wrist is not None) else head
+            others = [f for f in [head] + list(frames) if f is not src]     # views to add to the model
             oid = self.id_map.get(sid)
             if oid is None:
-                h_oid = self._held_at_pixel(head, uv)
+                h_oid = self._held_at_pixel(src, uv)
                 if h_oid is not None and h_oid not in bound:
                     # a new name for the object in the hand: same physical object, same model and payload
                     self.id_map[sid] = h_oid
@@ -854,19 +1006,19 @@ class Harness:
             if oid is not None and oid in self.objects and self.objects[oid].held:
                 bound.add(oid)
                 continue
-            hit = self.mask_for_point(head, o["prompts"], uv)
+            hit = self.mask_for_point(src, o["prompts"], uv)
             how = "sam"
-            if hit is None and self._is_table_pixel(head, uv):
+            if hit is None and self._is_table_pixel(src, uv):
                 # no object segment there and the pixel lies on the table plane: the named thing is the table top
                 # (region growing from a table pixel would snap to the edge of some neighbouring object)
                 oid = oid if oid is not None else self._new_oid()
                 self.id_map[sid] = oid
                 bound.add(oid)
-                self.objects[oid] = self._table_model(oid, head, uv, o)
+                self.objects[oid] = self._table_model(oid, src, uv, o)
                 self.log("grounded", object=sid, oid=oid, how="table_plane", summary=self.objects[oid].summary())
                 continue
             if hit is None:
-                m = grow_region(head, (uv[1], uv[0]), self.table_z)
+                m = grow_region(src, (uv[1], uv[0]), self.table_z)
                 how = "grow"
                 if m.sum() < 15:
                     failures.append({"object": sid, "name": o["name"], "reason": "no segment at the given pixel"})
@@ -874,7 +1026,25 @@ class Harness:
                     continue
                 hit = (m, 0.0, None)
             mask = hit[0]
-            pts = mask_points(head, mask)
+            # one object, one model: a segment's points on another tracked object are not this object's - except its
+            # own parent fixture (whose model still holds the part's surface until the parts are cut out below)
+            parent_oid = self.id_map.get(o.get("part_of")) if o.get("part_of") else None
+            pts = mask_points(src, mask)
+            if parent_oid is None:
+                pts = self._without_others(pts, oid)
+            old = self.objects.get(oid) if oid is not None else None
+            if old is not None and not old.held and not o.get("part_of") and len(old.points) >= 30 and \
+                    len(pts) >= 10 and float(np.mean(old.surface_distance(pts) < 0.015)) >= 0.7 and \
+                    float(np.ptp(pts, axis=0).max()) < 0.8 * float(np.ptp(old.points, axis=0).max()):
+                # System 1 named a part of an object already tracked (its handle, its rim): the object stays whole and
+                # the part is where its grasp is preferred
+                old.add_points(pts)
+                old.prefer = (pts.mean(0), max(0.02, 0.5 * float(np.ptp(pts, axis=0).max())))
+                self.id_map[sid] = oid
+                bound.add(oid)
+                self.log("ground_part_of_tracked", object=sid, oid=oid, prefer_center=old.prefer[0],
+                         prefer_radius=old.prefer[1], summary=old.summary())
+                continue
             if oid is None:
                 oid = self._same_as_tracked(pts, exclude=bound)
                 if oid is not None:
@@ -889,22 +1059,25 @@ class Harness:
             model = ObjectModel(oid, o["name"], o["prompts"][0], o["role"], support, pixel_hint=uv)
             model.prompts = list(o["prompts"])
             model.add_points(pts)
-            model.views.append(("head", how, float(hit[1])))
+            model.views.append(("head" if src is head else src.name, how, float(hit[1])))
             if len(model.points) < 10:
                 failures.append({"object": sid, "name": o["name"], "reason": "segment has no valid depth"})
                 continue
-            for fr in frames:
+            for fr in others:
                 mt = self.mask_matching(fr, o["prompts"], model)
                 if mt is None:
                     continue
                 extra = self.filter_points(mask_points(fr, mt[0]), model)
+                if parent_oid is None:
+                    extra = self._without_others(extra, oid)
                 model.add_points(extra)
                 model.views.append((fr.name, "sam", float(mt[3])))
             if o.get("part_of"):
                 model.part_of = self.id_map.get(o["part_of"])
             self.objects[oid] = model
+            self._forget_free(model.points)
             self.log("grounded", object=sid, oid=oid, how=how, prompt=hit[2], score=hit[1], summary=model.summary(),
-                     views=model.views)
+                     views=model.views, image=2 if src is not head else 1)
         # parts: remove their points from the parent model
         for m in self.objects.values():
             if m.part_of and m.part_of in self.objects:
@@ -1035,13 +1208,17 @@ class Harness:
                 lab[pm] = oid
             self.scene.integrate(fr, lab, extra_mask=fr.meta.get("held_mask"), robot_shadow_free=self.shadow_rule(fr),
                                  held_box=fr.meta.get("held_box"))
+        self._remember_free()
+        hollow = self._hollow_oids()
         for m in self.objects.values():
             if not m.held and not getattr(m, "virtual", False):
-                self.scene.insert_object(m)
+                # inferred fill never overwrites seen-free; a container's unseen interior is not inferred solid
+                self.scene.insert_object(m, seen_free=self.free_mem, hollow=m.oid in hollow)
         if self.swept:
             self.carve_robot(np.array(self.swept), hulls=False)   # everywhere the arm has been holds nothing else
         self.carve_robot()
         self._clear_held_ghost()
+        self._recall_free()
         self.scene.finalize()
         for m in self.objects.values():
             if not m.held and not getattr(m, "virtual", False):
@@ -1049,10 +1226,21 @@ class Harness:
         self._tick("map", t)
         self._rec("on_map", "rebuild")
 
+    def _hollow_oids(self):
+        """Objects something is put "in" by the program (containers): their unseen interior is unknown, not solid."""
+        out = set()
+        for st in (self.program or {}).get("stages", []) or []:
+            if st.get("op") == "transfer" and st.get("relation") == "in":
+                oid = self.id_map.get(st.get("reference"))
+                if oid is not None:
+                    out.add(oid)
+        return out
+
     def refresh_object(self, model, frames, prompts):
         """Replace an object's points with fresh observations matched to its current model
-        (projected-mask IoU first; else the detection whose 3D centre is nearest the model)."""
-        new = []
+        (projected-mask IoU first; else the detection whose 3D centre is nearest the model). Points on another tracked
+        object are not this object's (a destination never absorbs what stands on it)."""
+        new, pts = [], np.zeros((0, 3))
         c0 = model.points.mean(0) if len(model.points) else None
         for fr in frames:
             mt = self.mask_matching(fr, prompts, model, min_iou=0.1)
@@ -1072,7 +1260,8 @@ class Harness:
             if best is not None:
                 new.append(best)
         if new and sum(len(n) for n in new) > 30:
-            pts = np.concatenate(new)
+            pts = self._without_others(np.concatenate(new), model.oid)     # one object, one model
+        if new and len(pts) > 30:
             bottom = float(np.percentile(pts[:, 2], 2))
             if bottom < model.support_z - 0.005:
                 # the object stands lower than recorded (a support height planned too high): measured wins, else the
@@ -1082,6 +1271,8 @@ class Harness:
             old = model.points
             model.points = np.zeros((0, 3))
             model.add_points(pts)
+            if len(model.points) >= 20:
+                self._forget_free(model.points)
             if len(model.points) < 20:
                 # the fresh points fell below the model's support height (planned too high): keep the old model
                 model.points = old
@@ -1097,6 +1288,10 @@ class Harness:
         the sensors (holding or not from the finger opening; fresh views into the map), so REPAIR can carry on.
         StageFailure and AstraError pass unchanged; KeyboardInterrupt and the evaluator's stop are not Exceptions."""
         self.cur_stage = st
+        if self.in_release and st.get("op") == "transfer" and st.get("relation") == "in" and \
+                st.get("release") != self.in_release:
+            self.log("release_override", stage=st.get("id"), program=st.get("release"), used=self.in_release)
+            st["release"] = self.in_release
         try:
             return self.run_stage(st)
         except (StageFailure, AstraError):
@@ -1138,7 +1333,9 @@ class Harness:
         for attempt in range(3):
             try:
                 if self.held is None or self.held != obj.oid:
-                    self.grasp_object(obj, st, result)
+                    want = self.lookahead_grasp(obj, dest, st, place_pt) \
+                        if self.placement == "unified" and self.motion != "cp5" and attempt == 0 else None
+                    self.grasp_object(obj, st, result, want=want)
                 self.place_object(obj, dest, st, place_pt, result)
                 return result
             except StageFailure as f:
@@ -1174,6 +1371,7 @@ class Harness:
         obj.points = np.zeros((0, 3))
         obj.support_z = self.table_z
         obj.add_points(best)
+        self._forget_free(obj.points)
         fr = self.look_from_above(np.r_[obj.footprint_center(), obj.top_z], height=0.26)
         if fr is not None:
             self.refresh_object(obj, [fr, head], [obj.category, obj.name])
@@ -1181,8 +1379,15 @@ class Harness:
         self.log("relocated", object=obj.name, center=obj.footprint_center(), top=obj.top_z)
         return True
 
-    def grasp_object(self, obj, st, result):
-        failed = []
+    # closed width minus predicted contact width (m) that still counts as the pads on the object where planned: the
+    # full test held 151 of 158 closes within -6..+4 mm and 14 of 16 within +4..+10 mm, 4 of 15 when more than 6 mm
+    # narrower and 3 of 7 when more than 10 mm wider
+    CLOSE_WINDOW = (-0.006, 0.010)
+
+    def grasp_object(self, obj, st, result, want=None):
+        """Grasp the object (top-down first, from the side when no top-down grasp fits or has an arm posture);
+        want: a grasp planned earlier to take (a regrasp at a staging spot), see plan_grasp."""
+        failed = []            # (point, radius): contact regions that failed, so the next attempt differs there
         for attempt in range(3):
             # a side no camera has seen yet is looked at first; the top look below then brings the hand back
             # above the object (top-down) and integrates both views
@@ -1204,15 +1409,28 @@ class Harness:
                             if m.oid == obj.oid:
                                 m.views.append((fr.name, "top", float(mt[3])))
                 self.rebuild_map(self.frames[-8:])
-            plan = self.plan_grasp(obj, failed)
-            if plan is None:
-                result["attempts"].append({"phase": "grasp", "status": "no_feasible_grasp"})
+            # a wanted grasp from above needs only the top-down family (no side generation)
+            fam = "top" if want is None or float(np.asarray(want[0])[2, 2]) < -0.8 else "all"
+            plans = self.plan_grasp(obj, failed, families=fam, want=want)
+            if not plans and want is None and self.motion != "cp5":
+                # no top-down grasp fits or has a posture (an object near the base, a handle on the side): any
+                # other approach direction on the same model (CONTACT_STAGE_PLAN 4.5)
+                plans = self.plan_grasp(obj, failed, families="side")
+                self.log("side_grasps", found=len(plans))
+            if not plans and want is not None:
+                want = None                       # the planned regrasp is not there any more: any grasp
+                plans = self.plan_grasp(obj, failed, families="all")
+            if not plans:
+                why = self._grasp_why(obj, result)
+                result["attempts"].append({"phase": "grasp", "status": "no_feasible_grasp", "cause": why["cause"]})
                 if attempt >= 1:
-                    raise StageFailure("no_feasible_grasp", object=obj.name, size=obj.summary()["size"],
-                                       max_gripper_opening=2 * (manip.FULL_JOINT + manip.PAD_OFFSET))
+                    raise StageFailure("no_feasible_grasp", object=obj.name, size=obj.summary()["size"], **why)
                 continue
-            g, q_pre, q_grasp, info = plan
+            g, q_pre, q_grasp, info = plans[0]
             f_open = g.info["finger"]
+            win = lambda h: (2 * (f_open + manip.PAD_OFFSET) - h.width) / 2
+            used = [plans[0]] + [pl for pl in plans[1:] if pl[0].info.get("gap") == g.info.get("gap")]
+            alts = [{"R": h.R, "p": h.p, "q": qg, "approach": h.R[:, 2], "window": win(h)} for h, _, qg, _ in used[1:]]
 
             def open_hand():
                 if g.info.get("gap") == "full":
@@ -1220,28 +1438,31 @@ class Harness:
                     return self.ex.gripper(-1.0, min_steps=8)
                 return self.ex.gripper_to(2 * (f_open + manip.PAD_OFFSET))   # pre-shape where full open does not fit
             self.log("open", opening=open_hand(), gap=g.info.get("gap"))
-            # lateral window = finger clearance per side at this opening
-            ok = self.reach(g.R, g.p, q_grasp, g.R[:, 2], obj.oid, (2 * (f_open + manip.PAD_OFFSET) - g.width) / 2,
-                            "to_pregrasp", 0.0, f_open, q_pre)
-            if not ok:
-                failed.append(g.p)
+            # the hand-off: the planned grasps (and their 180-degree twins) as one set; TRACE takes the first it
+            # certifies; lateral window = finger clearance per side at this opening
+            end = self.reach(g.R, g.p, q_grasp, g.R[:, 2], obj.oid, win(g), "to_pregrasp", 0.0, f_open, q_pre, alts=alts)
+            if end is None:
+                for h, _, _, _ in used:
+                    failed.append((h.p, 0.01))
                 result["attempts"].append({"phase": "grasp", "status": "transit_failed", "move": self.last_move})
                 if self.last_move.get("status") == "contact":
                     self.reobserve()
                 continue
+            g = used[int(getattr(end, "k", 0))][0]
+            Rg, pg = np.asarray(end.R, float), np.asarray(end.p, float)    # the twin's orientation when it was taken
             # descend with a force guard
             def guard(robot, F, F0, k):
                 return "early_contact" if np.linalg.norm(F - F0) > 12.0 and k > 2 else None
-            res = self.move_line(g.R, g.p, grip=0.0, speed=0.06, guard=self._guard("early_contact", guard),
+            res = self.move_line(Rg, pg, grip=0.0, speed=0.06, guard=self._guard("early_contact", guard),
                                  finger=f_open)
             if res is None or res.status not in ("done",):
                 self.log("descend", status=None if res is None else res.status)
-            short = float((g.p - self.rb.eef_pose()[1]) @ g.R[:, 2])
+            short = float((pg - self.rb.eef_pose()[1]) @ Rg[:, 2])
             tip_below_top = g.info.get("depth", 0.0) + manip.TIP_Z - short     # fingertips below the object's top
             if short > 0.006 and tip_below_top < 0.008:
                 # stopped with the fingertips at the top: a finger is on the object, not beside it - back off and
                 # look again (as r1: the spot is not excluded; the next look corrects the object model)
-                self.retreat(g.R, g.p - g.R[:, 2] * 0.10, grip=0.0, speed=0.12, finger=f_open, tag="back_off")
+                self.retreat(Rg, pg - Rg[:, 2] * 0.10, grip=0.0, speed=0.12, finger=f_open, tag="back_off")
                 result["attempts"].append({"phase": "grasp", "status": "blocked_descent", "short_m": round(short, 4)})
                 self.log("blocked_descent", short=short, tip_below_top=tip_below_top)
                 continue
@@ -1252,8 +1473,20 @@ class Harness:
             self.log("close", opening=opening, expect=g.width)
             if opening < 0.002:
                 open_hand()
-                self.retreat(g.R, g.p - g.R[:, 2] * 0.10, grip=0.0, speed=0.15, finger=f_open, tag="back_off")
+                self.retreat(Rg, pg - Rg[:, 2] * 0.10, grip=0.0, speed=0.15, finger=f_open, tag="back_off")
+                failed.append((g.p, 0.015, g.info.get("yaw", 0.0)))   # nothing between the pads there: differ next
                 result["attempts"].append({"phase": "grasp", "status": "empty_close", "opening": opening})
+                continue
+            dw = opening - g.width
+            if not (self.CLOSE_WINDOW[0] <= dw <= self.CLOSE_WINDOW[1]):
+                # the pads did not meet the object where planned (slid off, pushed it, or closed on something else):
+                # no lift; open, back off, and the next attempt grasps another region
+                open_hand()
+                self.retreat(Rg, pg - Rg[:, 2] * 0.10, grip=0.0, speed=0.15, finger=f_open, tag="back_off")
+                failed.append((g.p, 0.015, g.info.get("yaw", 0.0)))
+                result["attempts"].append({"phase": "grasp", "status": "unexpected_width", "opening": round(opening, 4),
+                                           "expected": round(g.width, 4)})
+                self.log("grasp_width_mismatch", opening=opening, expected=g.width, window=self.CLOSE_WINDOW)
                 continue
             # attach payload (re-centred between the pads: closing fingers centre the object) and lift;
             # the collision model is closed (hull of the observed surface down to its base), the object model
@@ -1281,13 +1514,65 @@ class Harness:
             self.held_width = opening2                       # settled grip after the lift = drop reference
             if res is not None and res.status == "dropped" or opening2 < 0.002:
                 self._release_attachment(obj, dropped=True)
+                failed.append((g.p, 0.015, g.info.get("yaw", 0.0)))   # it slipped from this grasp: differ next
                 result["attempts"].append({"phase": "lift", "status": "dropped", "opening": opening2})
                 continue
+            if (res is None or res.status not in ("done", "dropped")) and \
+                    np.linalg.norm(self.rb.eef_pose()[1] - ps) < 0.01:
+                # the arm cannot leave the grasp pose (no posture along the lift, no certified segment): let go where
+                # the object still stands, so nothing is carried from a pose the next moves cannot start from; the
+                # next attempt grasps elsewhere
+                self.log("cannot_leave_pose", status=None if res is None else res.status, tag="lift")
+                self.ex.gripper(-1.0, min_steps=8)
+                self._release_attachment(obj)
+                self.scene.insert_object(obj)
+                failed.append((g.p, 0.02))
+                result["attempts"].append({"phase": "lift", "status": "cannot_leave_pose"})
+                continue
+            if not hasattr(self, "_grasp_origin"):
+                self._grasp_origin = {}
+            self._grasp_origin[obj.oid] = np.asarray(obj.footprint_center(), float)   # free and reachable now
+            # the volume it stood in is empty now: what the cameras showed there outside its mask (a handle, a rim
+            # edge) is the object's leftover, not an obstacle; kept clear across map rebuilds (_clear_vacated)
+            lo, hi = obj.points.min(0) - 0.015, obj.points.max(0) + 0.015
+            lo[2] = max(float(lo[2]), self.table_z + 0.005)
+            self._vacated = getattr(self, "_vacated", []) + [(obj.oid, lo, hi)]
+            self._clear_vacated()
             result["attempts"].append({"phase": "grasp", "status": "held", "opening": round(opening2, 4),
                                        "grasp_width_pred": round(g.width, 4), "yaw": g.info.get("yaw")})
             self.log("held", object=obj.name, opening=opening2)
             return True
-        raise StageFailure("grasp_failed", object=obj.name, attempts=result["attempts"][-3:])
+        raise StageFailure("grasp_failed", object=obj.name, attempts=result["attempts"][-3:],
+                           **self._grasp_why(obj, result))
+
+    def _grasp_why(self, obj, result):
+        """Typed cause of a failed grasp stage, with the levers that match it (System 1 acts on these, not on the
+        object's size)."""
+        d = getattr(self, "_grasp_diag", None) or {}
+        tried = [a for a in result.get("attempts", []) if a.get("phase") in ("grasp", "lift")]
+        last = tried[-1] if tried else {}
+        model = {"points": int(len(obj.points)), "size_m": obj.summary()["size"], "views": [v[0] for v in obj.views]}
+        if last.get("status") == "transit_failed":
+            why = (last.get("move") or {}).get("why") or {}
+            return {"cause": "hand_could_not_get_to_the_grasp", "detail": why, "model": model,
+                    "levers": "the way to the grasp is blocked or the arm is at its limits there: another object order, "
+                              "or re-point the object if its model includes a neighbour"}
+        if last.get("status") in ("dropped", "unexpected_width", "empty_close"):
+            return {"cause": {"dropped": "slipped_at_lift", "unexpected_width": "pads_missed_the_object",
+                              "empty_close": "closed_on_nothing"}[last["status"]], "model": model,
+                    "levers": "the object's model may be wrong (another object, or only part of it): re-point it, in "
+                              "image 2 if the head camera does not show it"}
+        if d.get("candidates", 0) == 0:
+            cause, lever = "no_grasp_on_the_model", ("the model may be partial or not the object: re-point it (image 2 "
+                                                     "if the head camera does not show it)")
+        elif d.get("hand_fit", 0) == 0:
+            cause, lever = "no_room_for_the_open_hand", (f"the open hand meets {d.get('blocked_by')}: another order, or "
+                                                         "re-point if the model includes a neighbour")
+        else:
+            cause, lever = "no_arm_posture", (f"grasps exist on the model, none with an arm posture "
+                                              f"({d.get('reach_m')} m from the shoulder)")
+        return {"cause": cause, "levers": lever, "model": model, "grasps_on_model": d.get("candidates"),
+                "hand_fits": d.get("hand_fit")}
 
     def _release_attachment(self, obj, dropped=False):
         self.checker.attached = None
@@ -1296,18 +1581,66 @@ class Harness:
         if dropped:
             self.ex.gripper(-1.0)
 
-    def plan_grasp(self, obj, failed):
+    def hand_height(self, cands, top_z):
+        """How far each grasp's open hand rises above top_z (m): a put-down under something (a roof, a shelf) needs
+        the hand low beside the object, not above it."""
+        if not cands:
+            return np.zeros(0)
+        L, _, _ = self._hand_local(manip.FULL_JOINT)
+        return np.array([float((g.p + L @ g.R.T)[:, 2].max()) - float(top_z) for g in cands])
+
+    def plan_grasp(self, obj, failed, k_max=3, budget_s=12.0, families="top", want=None, level_first=False):
+        """See _plan_grasp. Unsegmented surface hugging the object (a handle or a rim edge outside its mask) is the
+        object itself during the checks, not an obstacle next to it."""
+        fn, self.checker.free_near = self.checker.free_near, [(np.asarray(obj.points, float), 0.01, True)]
+        try:
+            return self._plan_grasp(obj, failed, k_max, budget_s, families, want, level_first)
+        finally:
+            self.checker.free_near = fn
+
+    def _plan_grasp(self, obj, failed, k_max=3, budget_s=12.0, families="top", want=None, level_first=False):
+        """Up to k_max distinct feasible grasps [(g, q_pre, q_grasp, info)], best first (the hand-off is a set);
+        [] when none. failed: (point, radius) regions excluded by earlier attempts. self._grasp_diag says why when
+        nothing is found.
+        families: "top" (approach within 35 degrees of vertical), "side" (any other direction, CONTACT_STAGE_PLAN 4.5)
+        or "all". want: (R, p) of a grasp planned earlier (a regrasp): only grasps near it, nearest first.
+        level_first: the grasps whose hand rises least above the object first (the hand low beside it, for a
+        put-down under something)."""
         t = time.time()
         R0, _ = self.rb.eef_pose()
         cur_yaw = np.arctan2(R0[1, 0], R0[0, 0])
-        cands = grasp_candidates(obj, obj.support_z, cur_yaw=cur_yaw)
-        cands = [c for c in cands if all(np.linalg.norm(c.p - f) > 0.01 for f in failed)]
+        cands = grasp_candidates(obj, obj.support_z, cur_yaw=cur_yaw) if families in ("top", "all") else []
+        if families in ("side", "all"):
+            cands = sorted(cands + manip.side_grasp_candidates(obj.points, obj.name, manip.side_directions(), cur_R=R0),
+                           key=lambda c: -c.score)
+        if level_first and cands:
+            cands = [c for c in cands if float(c.R[2, 2]) <= 0.25]       # not from below (for a put-down)
+            hh = self.hand_height(cands, obj.top_z)
+            order_ = np.lexsort((-np.array([c.score for c in cands]), np.round(hh, 2)))
+            cands = [cands[i] for i in order_]
+        if want is not None:
+            Rw, pw = np.asarray(want[0], float), np.asarray(want[1], float)
+            near = lambda c: (float(np.degrees(np.arccos(np.clip(c.R[:, 2] @ Rw[:, 2], -1, 1)))),
+                              float(np.linalg.norm(c.p - pw)))
+            cands = [c for c in cands if near(c)[0] <= 30.0 and near(c)[1] <= 0.03]
+            cands.sort(key=lambda c: near(c)[0] / 30.0 + near(c)[1] / 0.03)
+        pref = getattr(obj, "prefer", None)
+        if pref is not None and cands and want is None:
+            # a part System 1 named on this object (handle, rim): its region is preferred, the object stays whole
+            for c in cands:
+                if np.linalg.norm(c.p - pref[0]) <= pref[1]:
+                    c.score += 2.0
+            cands.sort(key=lambda c: -c.score)
+        cands = [c for c in cands if all(np.linalg.norm(c.p - f[0]) > f[1] or
+                                         (len(f) > 2 and abs(_wrap_pi(c.info.get("yaw", 0.0) - f[2])) > 0.5)
+                                         for f in failed)]
         self.log("grasp_cands", n=len(cands), top=[{"p": c.p, "w": c.width, "s": c.score, **c.info}
                                                   for c in cands[:5]])
         q_now = self.rb.q()[:7]
         tried = 0
         # rigid-hand prefilter (no IK): palm/fingers (pre-shaped) at the grasp pose and 4 cm before it
         hands = {}
+        blocked = {}
         def hand_fits(g, f):
             f = round(f, 3)
             if f not in hands:
@@ -1315,13 +1648,19 @@ class Harness:
             L, grp, rad = hands[f]
             for back in (0.0, 0.04):
                 Wh = g.p - g.R[:, 2] * back + L @ g.R.T
-                c = self.checker.point_clearance(Wh, (obj.oid,)) - rad
+                # observed geometry (user decision D2: unseen space is looked at by the transit, then crossed slowly)
+                c = self.checker.point_clearance(Wh, (obj.oid,), unknown=False) - rad
                 if c[grp == 1].min() < NEAR["palm"] or c[grp == 2].min() < NEAR["finger"]:
+                    if not blocked:
+                        blocked["pts"] = Wh[grp >= 1]
                     return False
                 zc = Wh[:, 2] - self.table_z - 0.5 * rad
-                if zc[grp == 1].min() < NEAR["plane_palm"] or zc[grp == 2].min() < NEAR["plane_finger"]:
+                if zc[grp == 1].min() < GRASP_NEAR["plane_palm"] or zc[grp == 2].min() < GRASP_NEAR["plane_finger"]:
                     return False
-            d = obj.signed_clearance(g.p + L @ g.R.T) - rad
+            # the object as a solid seen along the grasp's own direction (from above for the top-down family)
+            d = self.object_clearance(obj.points, g.p + L @ g.R.T, g.info.get("side"),
+                                      self.__dict__.setdefault("_side_model_cache", {})) - rad \
+                if g.info.get("side") is not None else obj.signed_clearance(g.p + L @ g.R.T) - rad
             return d[grp == 1].min() >= 0.006 and d[grp == 2].min() >= 0.0015
         def hand_ok(g):
             # fully open hand (binary open, as r1) wherever it fits; otherwise the widest pre-shape the
@@ -1337,20 +1676,31 @@ class Harness:
             return False
         order, seen = [], {}
         for g in cands:
-            k = round(g.info.get("tilt", 0.0), 2)
+            k = (round(g.info.get("tilt", 0.0), 2), tuple(g.info.get("side") or ()))
             if seen.get(k, 0) < 10 and hand_ok(g):
                 order.append(g)
                 seen[k] = seen.get(k, 0) + 1
         self.log("grasp_prefilter", kept=len(order), of=len(cands))
+        found = []
         for g in order[:40]:
+            if len(found) >= k_max or (found and time.time() - t > budget_s):
+                break
+            if any(np.linalg.norm(g.p - h[0].p) < 0.015 and abs(_wrap_pi(g.info["yaw"] - h[0].info["yaw"])) < 0.5
+                   for h in found):
+                continue                                   # a near-duplicate of a grasp already in the set
             f = g.info["finger"]
-            sols = self.ik_clear(g.R, g.p, q_now, exclude=(obj.oid,), finger=f)
+            # a wanted grasp (look-ahead, regrasp) is often a pitched one near the arm's limits: more starts
+            sols = self.ik_clear(g.R, g.p, q_now, exclude=(obj.oid,), finger=f, n_random=48 if want is not None else 16)
             if len(sols) == 0:
                 continue
             tried += 1
+            lim = self.rm.limits[:7]
+            jm = lambda Q: float(np.min(np.minimum(np.asarray(Q)[..., :7] - lim[:, 0], lim[:, 1] - np.asarray(Q)[..., :7])))
             for q_g in sols[:3]:
                 if not self._grasp_config_ok(q_g, obj, f):
                     continue
+                if jm(q_g) < GRASP_JOINT_SLACK:
+                    continue                         # the grasp posture sits at a joint limit: nothing can start from it
                 p_pre = g.p - g.R[:, 2] * 0.10
                 line = self.line_configs(g.R, g.p, self._ik_near(g.R, p_pre, q_g), finger=f)
                 if line is None:
@@ -1358,14 +1708,26 @@ class Harness:
                 good = all(self._grasp_config_ok(q, obj, f) for q in line[::2])
                 if not good:
                     continue
-                self._tick("grasp_plan", t)
-                self.log("grasp_plan", p=g.p, yaw=g.info["yaw"], tilt=g.info.get("tilt"), width=g.width, tried=tried,
-                         finger=f, local=g.info.get("local"), align=g.info.get("align"), depth=g.info.get("depth"))
-                return g, line[0], line[-1], g.info
+                # a grasp is a whole motion: the lift that follows must have a posture all the way up too
+                lift = self.line_configs(g.R, g.p + np.array([0.0, 0.0, 0.10]), line[-1], finger=f)
+                if lift is None or jm(lift) < 0.04:
+                    continue
+                self.log("grasp_plan", p=g.p, yaw=g.info["yaw"], tilt=g.info.get("tilt"), side=g.info.get("side"),
+                         approach=g.R[:, 2], width=g.width, tried=tried,
+                         finger=f, local=g.info.get("local"), align=g.info.get("align"), depth=g.info.get("depth"),
+                         rank=len(found))
+                found.append((g, line[0], line[-1], g.info))
+                break
             if tried >= 30:
                 break
         self._tick("grasp_plan", t)
-        return None
+        sh = self.rm.root_p + np.array([0.0, 0.0, 0.333])
+        self._grasp_diag = {"candidates": len(cands), "hand_fit": len(order), "arm_tried": tried,
+                            "reach_m": round(float(np.linalg.norm(np.r_[obj.footprint_center(), obj.top_z] - sh)), 2)
+                            if len(obj.points) else None,
+                            "blocked_by": (self.nearest_obstacle(blocked["pts"], (obj.oid,)) or {}).get("object")
+                            if blocked else None}
+        return found
 
     def ik_clear(self, R, p, q_ref, exclude=(), finger=0.04, n_random=16):
         """IK solutions incl. null-space (elbow) variants, sorted by whole-arm clearance."""
@@ -1451,7 +1813,8 @@ class Harness:
         return q[0]
 
     def _grasp_config_ok(self, q, obj, finger=0.04):
-        good, c = self.checker.ok(q[None], NEAR, exclude=(obj.oid,), finger=finger)
+        # observed geometry (user decision D2: unseen space is looked at by the transit, then crossed slowly)
+        good, c = self.checker.ok(q[None], GRASP_NEAR, exclude=(obj.oid,), finger=finger, unknown=False)
         if not good[0]:
             return False
         f = self.checker.fine(q[None], [obj.oid], finger=finger)
@@ -1461,6 +1824,8 @@ class Harness:
     def place_object(self, obj, dest, st, place_pt, result, region_override=None):
         if self.placement == "v2" and region_override is None:
             return self.place_object_v2(obj, dest, st, place_pt, result)
+        if self.placement == "unified" and region_override is None:
+            return self.place_object_unified(obj, dest, st, place_pt, result)
         rel = st["relation"]
         tol = st.get("tolerance", "normal")
         # release (S1 copies the instruction's verb): "drop" lets go over the reference, any final pose; the careful
@@ -1519,7 +1884,7 @@ class Harness:
             finger = self._finger()
             ok = self.reach(R_place, p_place, q_place, p_place - self._site_pose(q_pre, finger)[1], dest.oid,
                             PLACE_WINDOW["beside" if rel not in PLACE_WINDOW else rel].get(tol, 0.01), "to_preplace",
-                            0.0, finger, q_pre)
+                            0.0, finger, q_pre, twin=False) is not None
             if not ok and self.placement == "v1" and self.motion != "cp5" \
                     and (getattr(self, "last_move", None) or {}).get("status") == "no_path":
                 # v1: TRACE certifies a contact approach only up to a standoff where nothing touches, and a ranked
@@ -1602,11 +1967,18 @@ class Harness:
         rel = st["relation"]
         release = st.get("release") or ("drop" if rel == "in" else "place")
         notes, aim = [], None                    # notes: what happened in earlier attempts, for System 1
+        cleared = False
         for attempt in range(V2_TRIES):
             self._v2_half = self._v2_held_half()
             if aim is None:
                 aim = self._v2_pose(obj, dest, st, release, notes, place_pt)
             put = self._v2_put(obj, dest, rel, release == "drop", aim)
+            if put["status"] != "released" and not cleared and self._start_side(put.get("detail")):
+                # the way is blocked where it starts (the carried object still inside the margins): a pixel cannot
+                # change that; lift clear and try the same spot again, no model call
+                cleared = True
+                self._lift_clear()
+                put = self._v2_put(obj, dest, rel, release == "drop", aim)
             note = {"attempt": attempt + 1, "aimed_at_pixel": aim.get("pixel"), "long_side": aim.get("long_side"),
                     "result": put}
             if put["status"] != "released":
@@ -1634,6 +2006,36 @@ class Harness:
             aim = nxt
         raise StageFailure("placement_failed", attempts=result["attempts"][-3:], notes=notes[-3:])
 
+    def _why_words(self, w):
+        """A typed refusal (TraceMotion.why) in a sentence for System 1."""
+        k = w.get("kind")
+        if k == "no_arm_posture":
+            return "no arm posture reaches the pose above that point"
+        if k == "end_blocked":
+            return (f"the pose above that point is blocked: the {w.get('body')} would overlap {w.get('thing')} by "
+                    f"{w.get('overlap_mm')} mm")
+        if k == "path_blocked":
+            return (f"no collision-free way there: the path meets {w.get('thing')} "
+                    f"({w.get('short_mm')} mm short of the margin)")
+        if k == "arm":
+            d = w.get("detail") or {}
+            return f"the arm cannot follow the way there ({w.get('reason')}" + \
+                (f", joint {d.get('joint')})" if d.get("joint") else ")")
+        return "no collision-free path to above that point (search found none)"
+
+    @staticmethod
+    def _start_side(detail):
+        """A typed refusal that binds where the move starts (path or arm within the first 15 % of the way)."""
+        d = detail or {}
+        return d.get("kind") in ("path_blocked", "arm") and d.get("at_t") is not None and float(d["at_t"]) <= 0.15
+
+    def _lift_clear(self):
+        """Lift the hand (and what it holds) straight up until it clears the observed scene by the transit margins."""
+        Rs, ps = self.rb.eef_pose()
+        res = self.retreat(Rs, ps + np.array([0.0, 0.0, 0.06]), grip=0.0 if self.held is not None else None,
+                           speed=0.08, tag="lift_clear")
+        self.log("lift_clear", status=None if res is None else res.status)
+
     def _v2_held_half(self):
         """The held object's narrowest horizontal half-extent from its footprint centre (at any turn about the
         vertical): the room an opening must leave around the aim."""
@@ -1646,20 +2048,25 @@ class Harness:
         return {"object": obj.name, "reference": dest.name, "relation": st["relation"], "release": release,
                 "note": st.get("note")}
 
-    def _v2_pose(self, obj, dest, st, release, notes, place_pt):
+    def _v2_pose(self, obj, dest, st, release, notes, place_pt, before_grasp=False):
         """System 1 points at where the held object goes (one model call). Without an answer (call budget, error):
-        the program's place point, else the middle of the destination."""
+        the program's place point, else the middle of the destination. before_grasp: asked before the object is
+        picked up (the grasp is chosen for that put-down, CONTACT_STAGE_PLAN 4.5 look-ahead)."""
         head = self.capture(HEAD_CAMERA)
         self.frames.append(head)
         self.save_img("v2_pose_head", head.rgb)
-        content = self.task_parts() + [
+        content = self.task_parts() + ([text_part(
+            "The object is not held yet: it still stands where it is now and is picked up next, with a grasp chosen "
+            "for this put-down. Point where it should be put down.")] if before_grasp else []) + [
             text_part("Stage: " + json.dumps(self._v2_stage(obj, dest, st, release))),
             text_part("Earlier attempts of this stage: "
                       + (json.dumps(notes, default=_jsonable)[:3000] if notes else "none")),
             text_part(f"IMAGE 1 (head camera, {IMG}x{IMG}):"), image_part(head.rgb)]
         t = time.time()
+        instr = PLACE_POSE_INSTRUCTIONS_UNIFIED if self.placement == "unified" else PLACE_POSE_INSTRUCTIONS
         try:
-            data, rec = self.astra.call("place_pose", PLACE_POSE_INSTRUCTIONS, content, PLACE_POSE_SCHEMA)
+            data, rec = self.astra.call("place_pose", instr, content,
+                                        PLACE_POSE_SCHEMA_UNIFIED if self.placement == "unified" else PLACE_POSE_SCHEMA)
         except AstraError as e:
             self._tick("model_wait", t)
             xy = np.asarray(place_pt[:2] if place_pt is not None else dest.footprint_center(), float)
@@ -1667,6 +2074,7 @@ class Harness:
             return {"xy": xy, "long_side": "any", "pixel": None}
         self._tick("model_wait", t)
         aim = self._v2_aim(head, data["x"], data["y"], data["long_side"], dest, st["relation"])
+        aim["entry"] = data.get("entry")
         self.log("v2_pose", answer=data, record=rec, **{k: v for k, v in aim.items() if k not in ("long_side", "pixel")})
         return aim
 
@@ -1679,6 +2087,20 @@ class Harness:
         viewing direction."""
         H, W = fr.depth.shape
         x, y = int(np.clip(x, 0, W - 1)), int(np.clip(y, 0, H - 1))
+        if self.placement == "unified":
+            # the surface under the pixel is where the object's centre should rest (System 1 is told so); the rest
+            # poses are searched around it. "in" on a vertical face (a container's front panel): the interior support
+            # behind it instead
+            p = fr.pixel_ray_point(x, y)
+            if np.all(np.isfinite(p)):
+                aim = {"xy": p[:2].copy(), "rest_xy": p[:2].copy(), "z_top": float(p[2]), "long_side": long_side,
+                       "pixel": [x, y]}
+                if rel == "in" and not getattr(dest, "virtual", False):
+                    q = self._inward_support(fr, x, y, p, dest)
+                    if q is not None:
+                        self.log("aim_moved_inward", pointed=p, to=q)
+                        aim.update(xy=q[:2].copy(), rest_xy=q[:2].copy(), z_top=float(q[2]), pointed=p.copy())
+                return aim
         o = fr.T_wc[:3, 3]
         d = fr.T_wc[:3, :3] @ np.array([(x + 0.5 - fr.K[0, 2]) / fr.K[0, 0], (y + 0.5 - fr.K[1, 2]) / fr.K[1, 1], 1.0])
         if abs(d[2]) < 1e-6:
@@ -1703,7 +2125,8 @@ class Harness:
                 z = 0.5 * (tops[-1] + tops[-2])
         p = at(z)
         out = {"xy": p[:2].copy(), "z_top": float(z), "long_side": long_side, "pixel": [x, y]}
-        if rel == "in" and len(dest.points):
+        if rel == "in" and len(dest.points) and self.placement != "unified":
+            # (unified: no snap; the rest poses come from all observed geometry around the pointed spot)
             reg = container_region(dest)
             comp, lo_xy, cell, gxy = reg["compartments"], reg["lo_xy"], reg["cell"], reg["grid_xy"]
 
@@ -1730,10 +2153,45 @@ class Harness:
                            opening=k, room=round(float(room.max()), 3))
         return out
 
+    def _inward_support(self, fr, x, y, p0, dest, depth=(0.03, 0.25), lateral=0.12):
+        """System 1 pointed an "in" destination on a vertical face (the surface normal at the pixel is horizontal):
+        the interior support behind it, i.e. the lowest surface of the destination (its model and the unlabelled
+        surface connected to it) behind the face along the inward normal (`depth`), within `lateral` of that line and
+        not above the pointed spot; the point of it nearest that line. None when the face is not vertical or nothing is
+        found."""
+        Hh, Ww = fr.depth.shape
+        P = np.array([fr.pixel_ray_point(u, v) for u in range(max(0, x - 6), min(Ww, x + 7), 3)
+                      for v in range(max(0, y - 6), min(Hh, y + 7), 3)])
+        P = P[np.all(np.isfinite(P), axis=1)]
+        if len(P) < 8:
+            return None
+        w, V = np.linalg.eigh(np.cov((P - P.mean(0)).T))
+        n = V[:, 0]
+        if float(n @ (fr.T_wc[:3, 3] - p0)) < 0.0:
+            n = -n
+        if abs(float(n[2])) >= 0.5 or np.linalg.norm(n[:2]) < 1e-6:
+            return None
+        inward = -np.r_[n[:2], 0.0] / np.linalg.norm(n[:2])
+        side = np.array([-inward[1], inward[0], 0.0])
+        _, fx = self._fixture(dest, dest)
+        S = dest.points if fx is None or not len(fx) else np.concatenate([dest.points, fx])
+        d_in, lat = (S - p0) @ inward, (S - p0) @ side
+        sel = (d_in >= depth[0]) & (d_in <= depth[1]) & (np.abs(lat) <= lateral) & (S[:, 2] <= p0[2] + 0.02) & \
+            (S[:, 2] > self.table_z + 0.01)
+        if sel.sum() < 5:
+            return None
+        Q, dq, lq = S[sel], d_in[sel], lat[sel]
+        low = Q[:, 2] <= np.percentile(Q[:, 2], 5) + 0.01          # the lowest level: the floor inside
+        k = int(np.argmin(np.abs(lq[low]) + 0.3 * dq[low]))
+        return Q[low][k].copy()
+
     def _v2_yaws(self, fp, long_side):
         """Turns of the hand about the vertical to try: those that lay the payload's longest horizontal side along
         the direction System 1 named in the head image (the smaller of the two equivalent turns first), then the hand
-        as it is."""
+        as it is. When the long side does not matter ("any"), quarter turns too (smallest first): the set of hand-offs
+        the arm can choose from."""
+        if long_side in (None, "any") and self.motion != "cp5":
+            return [0.0, np.pi / 2, -np.pi / 2, np.pi]
         yaws = []
         if long_side not in (None, "any") and len(fp) >= 10:
             w, v = np.linalg.eigh(np.cov(fp.T))
@@ -1769,30 +2227,58 @@ class Harness:
         z_low = float(dest.points[:, 2].min()) if rel in ("in", "on") and len(dest.points) else self.table_z
         q_now = self.rb.q()[:7]
         yaw, why = None, "no arm posture reaches above that point"
-        for yaw_ in self._v2_yaws(pay[:, :2] - pay_c, aim.get("long_side")):
-            Rz = rot_z(yaw_)
-            R_place = Rz @ Rs
-            site_xy = xy + Rz[:2, :2] @ (ps[:2] - pay_c)
-            for up in (0.04, 0.10, 0.16):
-                p_pre = np.r_[site_xy, z_top + up + (ps[2] - bottom)]
-                sols = self.ik_clear(R_place, p_pre, q_now, exclude=(dest.oid,), finger=finger, n_random=8)
-                if len(sols) == 0:
-                    continue
-                if self.go_configs(list(sols[:3]), TRANSIT, grip=0.0, finger=finger, tag="v2_above"):
-                    yaw = yaw_
-                    break
+        yaws = self._v2_yaws(pay[:, :2] - pay_c, aim.get("long_side"))
+        if self.motion != "cp5":
+            # one hand-off set (CONTACT_STAGE_PLAN 4.2): the contact pose (payload just above what is under it) for
+            # every allowed turn about the vertical; TRACE slides each back up until its end test passes and the arm
+            # has a posture there, and takes the first it certifies; the guarded descent covers the rest
+            ends = []
+            for yaw_ in yaws:
+                Rz = rot_z(yaw_)
+                site_xy = xy + Rz[:2, :2] @ (ps[:2] - pay_c)
+                e = EndCandidate(Rz @ Rs, np.r_[site_xy, z_top + 0.005 + (ps[2] - bottom)],
+                                 approach=np.array([0.0, 0.0, -1.0]), standoff=SLIDE, entity=entity_of(self, dest.oid))
+                e.yaw = yaw_
+                ends.append(e)
+            res = self.tm.move(ends, "v2_above", grip=0.0, finger=finger, entity=entity_of(self, dest.oid),
+                               approach=np.array([0.0, 0.0, -1.0]), keep_ends=len(ends))
+            if res is not None and res.status == "dropped":
+                raise StageFailure("dropped_in_transit")
+            if res is not None and res.status == "done" and self.tm.last_end is not None:
+                yaw = float(self.tm.last_end.yaw)
+            else:
                 lm = getattr(self, "last_move", None) or {}
-                why = f"no collision-free path to above that point ({lm.get('status') or lm.get('result')})"
+                w = lm.get("why") or {}
+                why = self._why_words(w) if w else f"no collision-free path to above that point ({lm.get('status')})"
                 if lm.get("status") == "contact":
                     why = f"the move there ran into {lm.get('contact_near')}"
-                    self.reobserve()               # something was hit: the map is stale where it matters
-                    q_now = self.rb.q()[:7]
+                    self.reobserve()
+        else:
+            for yaw_ in yaws:
+                Rz = rot_z(yaw_)
+                R_place = Rz @ Rs
+                site_xy = xy + Rz[:2, :2] @ (ps[:2] - pay_c)
+                for up in (0.04, 0.10, 0.16):
+                    p_pre = np.r_[site_xy, z_top + up + (ps[2] - bottom)]
+                    sols = self.ik_clear(R_place, p_pre, q_now, exclude=(dest.oid,), finger=finger, n_random=8)
+                    if len(sols) == 0:
+                        continue
+                    if self.go_configs(list(sols[:3]), TRANSIT, grip=0.0, finger=finger, tag="v2_above"):
+                        yaw = yaw_
+                        break
+                    lm = getattr(self, "last_move", None) or {}
+                    why = f"no collision-free path to above that point ({lm.get('status') or lm.get('result')})"
+                    if lm.get("status") == "contact":
+                        why = f"the move there ran into {lm.get('contact_near')}"
+                        self.reobserve()               # something was hit: the map is stale where it matters
+                        q_now = self.rb.q()[:7]
+                        break
+                if yaw is not None:
                     break
-            if yaw is not None:
-                break
         if yaw is None:
-            self.log("v2_put", status="could_not_reach_above_point", why=why, xy=xy, z_top=z_top)
-            return {"status": "could_not_reach_above_point", "why": why}
+            detail = (getattr(self, "last_move", None) or {}).get("why")
+            self.log("v2_put", status="could_not_reach_above_point", why=why, xy=xy, z_top=z_top, detail=detail)
+            return {"status": "could_not_reach_above_point", "why": why, "detail": detail}
         Rc, pc = self.rb.eef_pose()
         bottom = float(self._payload_world(Rc, pc)[:, 2].min())
         Wr, _ = self.checker.world_points(self.rb.q()[None, :7], finger)
@@ -1830,18 +2316,22 @@ class Harness:
                  release_bottom_above_table=round(end_bottom - self.table_z, 4))
         return out
 
-    def _v2_look(self, obj, dest, st, release, put, notes):
+    def _v2_look(self, obj, dest, st, release, put, notes, relocalized=False):
         """After the release: lift clear, take fresh head and wrist images, and let System 1 judge the result (one
         model call). Returns (its answer, the next aim when it is not done and System 1 pointed again). Without an
-        answer, done is None: accepted as put, VERIFY judges at the end."""
+        answer, done is None: accepted as put, VERIFY judges at the end. relocalized: the object's known shape was
+        already registered where it rests (one object, one model): no new segmentation."""
         self.retreat_home()
         head = self.capture(HEAD_CAMERA)
         wrist = self.capture(WRIST_CAMERA)
         self.frames += [head, wrist]
         self.save_img("v2_look_head", head.rgb)
         self.save_img("v2_look_wrist", wrist.rgb)
-        refreshed = self.refresh_object(obj, [wrist, head],
-                                        list(dict.fromkeys([obj.category, obj.name] + list(obj.prompts or []))))
+        refreshed = relocalized
+        if not relocalized:
+            fit = self.relocalize(obj, [wrist, head])
+            refreshed = fit is not None or self.refresh_object(
+                obj, [wrist, head], list(dict.fromkeys([obj.category, obj.name] + list(obj.prompts or []))))
         self.rebuild_map(self.frames[-8:])
         content = self.task_parts() + [
             text_part("Stage: " + json.dumps(self._v2_stage(obj, dest, st, release))),
@@ -1851,7 +2341,8 @@ class Harness:
         content += self.head_and_wrist_content(head, wrist)
         t = time.time()
         try:
-            data, rec = self.astra.call("place_look", PLACE_LOOK_INSTRUCTIONS, content, PLACE_LOOK_SCHEMA)
+            data, rec = self.astra.call("place_look", PLACE_LOOK_INSTRUCTIONS_UNIFIED if self.placement == "unified"
+                                        else PLACE_LOOK_INSTRUCTIONS, content, PLACE_LOOK_SCHEMA)
         except AstraError as e:
             self._tick("model_wait", t)
             self.log("v2_look_error", error=repr(e))
@@ -1883,7 +2374,12 @@ class Harness:
         obj.support_z = support_z
         drop = max(0.0, float(moved[:, 2].min()) - (support_z + 0.001))
         obj.set_points(model - np.array([0, 0, drop]))
-        self.scene.insert_object(obj)
+        self._forget_free(obj.points)
+        # something is there again: a vacated volume it lands in is no longer cleared
+        lo_o, hi_o = obj.points.min(0), obj.points.max(0)
+        self._vacated = [(o, lo, hi) for o, lo, hi in getattr(self, "_vacated", [])
+                         if np.any(hi < lo_o) or np.any(lo > hi_o)]
+        self.scene.insert_object(obj, force=True)
 
     def _payload_world(self, Rs, ps):
         return ps + self.checker.attached.pts_site @ Rs.T
@@ -2897,6 +3393,13 @@ class Harness:
         part = self.obj(st["object"])
         parent = self.objects.get(part.part_of) if part.part_of else None
         motion = st.get("motion") or "rotate"
+        if motion in ("push", "pull"):
+            # a part of a part (a handle on a drawer, on a door) moves with it: the body that slides or swings is
+            # the outermost moving part, and its state is measured against the fixture it is mounted in
+            while parent is not None and parent.part_of is not None and parent.part_of in self.objects \
+                    and len(parent.points) >= 20:
+                self.log("actuate_part_promoted", named=part.name, moving=parent.name)
+                part, parent = parent, self.objects[parent.part_of]
         direction = st.get("turn_direction")
         result = {"stage": st["id"], "op": "actuate", "object": part.name, "motion": motion,
                   "goal": st.get("goal"), "attempts": []}
@@ -2942,11 +3445,13 @@ class Harness:
             g, q_pre, q_g = plan
             f_open = g.info["finger"]
             self.ex.gripper_to(2 * (f_open + manip.PAD_OFFSET))
-            if not self.reach(g.R, g.p, q_g, g.R[:, 2], part.oid, (2 * (f_open + manip.PAD_OFFSET) - g.width) / 2,
-                              "to_part", 0.0, f_open, q_pre):
+            end = self.reach(g.R, g.p, q_g, g.R[:, 2], part.oid, (2 * (f_open + manip.PAD_OFFSET) - g.width) / 2,
+                             "to_part", 0.0, f_open, q_pre)
+            if end is None:
                 failed.append(g.p)
-                result["attempts"].append({"status": "transit_failed"})
+                result["attempts"].append({"status": "transit_failed", "why": (self.last_move or {}).get("why")})
                 continue
+            g, q_g = self._taken(g, end, q_g)
             def guard(robot, F, F0, k):
                 return "early_contact" if np.linalg.norm(F - F0) > 10.0 and k > 2 else None
             self.move_line(g.R, g.p, grip=0.0, speed=0.05, guard=self._guard("early_contact", guard), finger=f_open)
@@ -3086,6 +3591,7 @@ class Harness:
                 use = same + [f for f in use if not any(f is g_ for g_ in same)] if same else [confirmed] + use
             return use
 
+        prev_state, no_progress = None, 0
         for attempt in range(self.MAX_LINEAR_ATTEMPTS):
             if self.elapsed() > self.max_wall_s:
                 result["attempts"].append({"status": "wall_clock_limit"})
@@ -3105,6 +3611,8 @@ class Harness:
                         # displacement from there) and how far it stands out (sizes the end-of-stroke check)
                         pre = self._measure_state(part, use[0], [fr, self.capture(HEAD_CAMERA)])
                         self.log("part_state_before", **pre)
+                        if pre.get("measured"):
+                            prev_state = pre
                         if pre.get("front_m") is not None:
                             front_pt = use[0]["p0"] + np.asarray(use[0]["n"]) * float(pre["front_m"])
                         if pre.get("measured") and pre.get("closed") is False and pre.get("offset_m") is not None:
@@ -3120,12 +3628,19 @@ class Harness:
                      hypotheses=[{"n": np.round(f["n"], 3), "source": f["source"], "score": round(f["score"], 2),
                                   "lift": round(f["lift"], 3), "why_not": f["why_not"]} for f in hyps])
             before = part.points.copy()
+            contents = self._contents_of(part)
             end_ok = self._closing_end_check(part, mf, remaining, fixture_pt) if want == "closed" else None
+            # how far the hand has to push for the part to close (its measured offset, plus the end-stop margin)
+            expected = remaining + self.CLOSE_PAST if (want == "closed" and remaining is not None) else None
             plan = self.plan_part_grasp(part, parent, mf, failed, motion, end_check=end_ok)
             if plan is not None:
                 stroke = self._grip_stroke(mf, plan, motion, failed, result, part)
+                if stroke is None and motion == "push" and result["attempts"] and \
+                        result["attempts"][-1].get("status") == "missed_part":
+                    # the grip closed on nothing (a thin edge): a push does not need a grip, press the part instead
+                    stroke = self._press_stroke(part, parent, mf, failed, result, end_check=end_ok, expected=expected)
             elif motion == "push":
-                stroke = self._press_stroke(part, parent, mf, failed, result, end_check=end_ok)
+                stroke = self._press_stroke(part, parent, mf, failed, result, end_check=end_ok, expected=expected)
             else:
                 result["attempts"].append({"status": "no_feasible_grip"})
                 stroke = "no_plan"
@@ -3138,7 +3653,29 @@ class Harness:
                 continue
             fb = None if front_pt is None else float((front_pt - mf["p0"]) @ np.asarray(mf["n"], float))
             fl = None if fixture_pt is None else float((fixture_pt - mf["p0"]) @ np.asarray(mf["n"], float))
-            state = self._observe_after_stroke(part, mf, motion, stroke, before, front_before=fb, fixture_level=fl)
+            state = self._observe_after_stroke(part, mf, motion, stroke, before, front_before=fb, fixture_level=fl,
+                                               contents=contents)
+            shift = float(state.get("face_shift_m") or 0.0) * (1.0 if motion == "push" else -1.0)
+            hand_ax = max(0.0, float(np.asarray(stroke["disp"]) @ (-np.asarray(mf["n"]) if motion == "push"
+                                                                    else np.asarray(mf["n"]))))
+            if prev_state is not None and state.get("closed") is not None and \
+                    shift > hand_ax + max(0.02, 0.15 * hand_ax):
+                # the part cannot have moved further than the hand pushed or pulled it: the reading contradicts the
+                # travel (a part pressed on the wrong face is not closed by being looked at); the earlier measurement
+                # moved by the hand's travel stands, unmeasured
+                self.log("state_inconsistent", hand_travel=round(hand_ax, 4), measured_shift=round(shift, 4),
+                         now=self._state_words(state), before=self._state_words(prev_state))
+                off = prev_state.get("offset_m")
+                if hand_ax < 0.01:
+                    # the hand did not move: the part did not either, the earlier measurement stands
+                    state = dict(prev_state, face_shift_m=0.0, why="the hand did not move: the earlier measurement "
+                                                                   "stands")
+                else:
+                    state = dict(state, measured=False, closed=None, face_shift_m=round(
+                        hand_ax * (1.0 if motion == "push" else -1.0), 4),
+                        offset_m=None if off is None else round(max(0.0, float(off) - hand_ax), 4),
+                        why="the measured shift exceeds the hand's travel")
+            prev_state = state if state.get("measured") else prev_state
             last_state = state
             front_pt = None if state.get("front_m") is None else \
                 mf["p0"] + np.asarray(mf["n"]) * float(state["front_m"])
@@ -3178,6 +3715,14 @@ class Harness:
                     result["relation_check"] = {"satisfied": False, "unverified": True, **moved}
                 self.log("actuated", result=result)
                 return result
+            if verdict == "again":
+                prog = abs(float(state.get("face_shift_m") or 0.0))
+                no_progress = no_progress + 1 if prog < 0.005 else 0
+                if no_progress >= 2:
+                    # two strokes without the part moving: another stroke from the same contact will not do it
+                    result["attempts"][-1]["no_progress"] = True
+                    bad.append(mf)
+                    no_progress = 0
             if verdict == "face_suspect":
                 bad.append(mf)
                 self._face_status(faces, mf, f"used: the part did not move along this face's axis "
@@ -3370,11 +3915,13 @@ class Harness:
         g, q_pre, q_g = plan
         f_open = g.info["finger"]
         self.ex.gripper_to(2 * (f_open + manip.PAD_OFFSET))
-        if not self.reach(g.R, g.p, q_g, g.R[:, 2], part.oid, (2 * (f_open + manip.PAD_OFFSET) - g.width) / 2,
-                          "to_part", 0.0, f_open, q_pre):
+        end = self.reach(g.R, g.p, q_g, g.R[:, 2], part.oid, (2 * (f_open + manip.PAD_OFFSET) - g.width) / 2,
+                         "to_part", 0.0, f_open, q_pre)
+        if end is None:
             failed.append(g.p)
-            result["attempts"].append({"status": "transit_failed"})
+            result["attempts"].append({"status": "transit_failed", "why": (self.last_move or {}).get("why")})
             return None
+        g, q_g = self._taken(g, end, q_g)
         def guard(robot, F, F0, k):
             return "early_contact" if np.linalg.norm(F - F0) > 10.0 and k > 2 else None
         self.move_line(g.R, g.p, grip=0.0, speed=0.05, guard=self._guard("early_contact", guard), finger=f_open)
@@ -3395,6 +3942,7 @@ class Harness:
             return None
         p_start = self.rb.eef_pose()[1].copy()
         travel, why, d = articulate.translate(self, mf["n"], motion)
+        self.log("leg", tag="grip_stroke", cause=why, travel=round(travel, 4), motion=motion)
         disp = self.rb.eef_pose()[1] - p_start
         result["attempts"].append({"status": motion, "mode": "grip", "travel_m": round(travel, 3), "stop": why})
         self.ex.gripper_to(2 * (f_open + manip.PAD_OFFSET))            # release only as wide as approached
@@ -3402,7 +3950,11 @@ class Harness:
         self.retreat(Rs, ps - Rs[:, 2] * 0.08, grip=0.0, speed=0.12, finger=f_open, tag="release_back")
         return {"mode": "grip", "travel": float(travel), "stop": why, "d": d, "disp": disp, "point": g.p}
 
-    def _press_stroke(self, part, parent, mf, failed, result, end_check=None):
+    PRESS_SEARCH_S = (15.0, 30.0)   # s: press-pose search: stop at the first nearest-to-clear pose after the first, always
+    # after the second (a refused search must not cost a minute: CONTACT_STAGE_PLAN 4.2.6)
+    RESEATS = 6                     # continuations in contact per stroke, while each one still moves the part
+
+    def _press_stroke(self, part, parent, mf, failed, result, end_check=None, expected=None):
         """'push' when the part cannot be gripped: press it with the closed hand. The hand's approach axis points along
         the push direction (-n, into the face the part is mounted on); the closed fingertips meet the part's outermost
         face at its centre, coming in from 6 cm in front; then the same compliant push as with a grip
@@ -3466,7 +4018,12 @@ class Harness:
                 for roll in (0.0, np.pi / 2, np.pi / 4, -np.pi / 4):
                     poses.append(("tip", a_, frame_from_axes(a_, np.cos(roll) * u + np.sin(roll) * v),
                                   c - a_ * (manip.TIP_Z + 0.002), c))
+        t_search = time.time()
         for mode, a_dir, R, p_touch, c in poses:
+            el = time.time() - t_search
+            if el > self.PRESS_SEARCH_S[1] or (el > self.PRESS_SEARCH_S[0] and fallback is not None):
+                why_n["search_time_limit"] = 1
+                break
             sols = self.ik_clear(R, p_touch - a_dir * 0.06, q_now, exclude=excl, finger=0.0, n_random=8)
             if len(sols) == 0:
                 why_n[f"{mode}_no_clear_ik"] = why_n.get(f"{mode}_no_clear_ik", 0) + 1
@@ -3510,11 +4067,14 @@ class Harness:
         mode, R, p_touch, q_pre, c, a_dir = plan
         self.log("press_plan", point=c, normal=n, approach=a_dir, mode=mode)
         self.ex.gripper(1.0, max_steps=25)                                  # closed hand
-        if not self.reach(R, p_touch, self._ik_near(R, p_touch, q_pre), a_dir, part.oid, press_win, "to_press", 1.0,
-                          0.0, q_pre):
+        end = self.reach(R, p_touch, self._ik_near(R, p_touch, q_pre), a_dir, part.oid, press_win, "to_press", 1.0,
+                         0.0, q_pre)
+        if end is None:
             failed.append(c)
-            result["attempts"].append({"status": "transit_failed", "pressing": True})
+            result["attempts"].append({"status": "transit_failed", "pressing": True,
+                                       "why": (self.last_move or {}).get("why")})
             return None
+        R = np.asarray(end.R, float)                 # closed fingertips are symmetric: the twin presses the same
         def guard(robot, F, F0, k):
             return "contact" if np.linalg.norm(F - F0) > 8.0 and k > 2 else None
         if mode == "tip":
@@ -3525,16 +4085,87 @@ class Harness:
                            finger=0.0)                                                    # down in front of the face
         p_start = self.rb.eef_pose()[1].copy()
         travel, why, d = articulate.translate(self, n, "push", grip_check=False)
+        reseats = 0
+        # continuation in contact (CONTACT_STAGE_PLAN 4.3): the hand stopped (force, stall) before the part can have
+        # reached its goal, which the measured offset says is `expected` metres of travel away: the hand is still at
+        # the part, so re-seat a little away from what blocked it and push on, with no new transit and no new search
+        while expected is not None and why in ("force_limit", "stalled") and reseats < self.RESEATS:
+            done_so_far = float((self.rb.eef_pose()[1] - p_start) @ -n)
+            if done_so_far >= expected - 0.005:
+                break
+            if not self._reseat(part, parent, n, a_dir):
+                break
+            reseats += 1
+            t2, why, d = articulate.translate(self, n, "push", max_travel=max(0.02, expected - done_so_far + 0.02),
+                                              grip_check=False)
+            if t2 < 0.005:
+                break                                # this re-seat no longer moves the part: the stroke ends here
         disp = self.rb.eef_pose()[1] - p_start
+        travel = float(np.linalg.norm(disp)) if reseats else travel
+        self.log("leg", tag="press_stroke", cause=why, travel=round(travel, 4), expected=expected, reseats=reseats)
         result["attempts"].append({"status": "press_push", "mode": "press", "pose": mode, "travel_m": round(travel, 3),
-                                   "stop": why})
+                                   "stop": why, "reseats": reseats})
         Rs, ps = self.rb.eef_pose()
         back = ps - a_dir * 0.06 if mode == "tip" else ps + n * 0.02 - a_dir * 0.06
         self.retreat(Rs, back, grip=1.0, speed=0.12, finger=0.0, tag="press_back")              # back off
         self.ex.gripper(-1.0, max_steps=12)
         return {"mode": "press", "travel": float(travel), "stop": why, "d": d, "disp": disp, "point": c}
 
-    def _observe_after_stroke(self, part, mf, motion, stroke, before, front_before=None, fixture_level=None):
+    def _reseat(self, part, parent, n, a_dir=None):
+        """Continue a push in contact: back off a few mm the way the hand came in (the reverse of its approach a_dir,
+        else along the face normal), move the contact point 1.5 cm (in the face plane) away from the nearest observed
+        thing that is not the part (what stopped the hand), and come back in guarded until the hand meets the part
+        again. True when it is on the part again."""
+        n = np.asarray(n, float)
+        out_dir = n if a_dir is None else -np.asarray(a_dir, float) / max(np.linalg.norm(a_dir), 1e-9)
+        Rs, ps = self.rb.eef_pose()
+        P = self._touch_points()
+        near = self.checker.near
+        near._labels(self.scene)
+        keep = near.lab != part.oid
+        down = np.array([0.0, 0.0, -1.0]) - n * float(n[2] * -1.0)
+        v = down
+        if keep.any():
+            d, i = cKDTree(near.cloud[keep]).query(P)
+            k = int(np.argmin(d))
+            if d[k] < 0.03:
+                v = P[k] - near.cloud[keep][i[k]]
+                v = v - n * float(v @ n)
+                if np.linalg.norm(v) < 1e-3:
+                    v = down
+        if np.linalg.norm(v) < 1e-6:
+            return False
+        v = v / np.linalg.norm(v)
+        back = ps + out_dir * 0.006
+        shifted = back + v * 0.015
+        for goal in (back, shifted):
+            # off the pressed part: the released preload is no contact; the detector alone guards (see retreat)
+            r = self.move_line(Rs, goal, grip=1.0, speed=0.03, finger=0.0, guard=self._guard("contact", None),
+                               force_limit=1e9)
+            if r is None or r.status != "done":
+                self.log("reseat", ok=False, at=goal, status=None if r is None else r.status)
+                return False
+        out = self.guarded_leg(Rs, shifted - n * 0.025, speed=0.03, window=(0.0, 0.03), grip=1.0, finger=0.0,
+                               tag="reseat_in")
+        self.log("reseat", ok=out.verdict == "as_expected", shift=v, verdict=out.verdict)
+        return out.verdict == "as_expected"
+
+    def _contents_of(self, part):
+        """Objects resting in or on a part: they move with it (a bowl in a drawer)."""
+        if len(part.points) < 20:
+            return []
+        lo, hi = part.points.min(0), part.points.max(0)
+        out = []
+        for oid, m in self.objects.items():
+            if oid in (part.oid, part.part_of) or m.held or getattr(m, "virtual", False) or len(m.points) < 10:
+                continue
+            c, b = m.footprint_center(), float(m.points[:, 2].min())
+            if np.all(c >= lo[:2] - 0.01) and np.all(c <= hi[:2] + 0.01) and lo[2] - 0.02 <= b <= hi[2] + 0.02:
+                out.append(m)
+        return out
+
+    def _observe_after_stroke(self, part, mf, motion, stroke, before, front_before=None, fixture_level=None,
+                              contents=()):
         """Measure the part's state after a stroke (articulate.articulation_state) from the head view and a wrist view
         along the face normal, and find the part again. A sliding part keeps its footprint on the face, so its moving
         front is searched over that footprint anywhere along the stroke axis (from deep inside to well past where it
@@ -3571,6 +4202,12 @@ class Harness:
         if state.get("front_m") is not None:
             delta = float(state["front_m"]) - fb                    # the front's measured displacement along n
             part.set_points(before + n * delta)
+            self._forget_free(part.points)
+            for m in contents:                                      # what lies in the part moved with it
+                m.set_points(m.points + n * delta)
+                self._forget_free(m.points)
+            if contents:
+                self.log("contents_moved", objects=[m.name for m in contents], shift_m=round(float(delta), 4))
             state["face_shift_m"] = round(-delta, 4)
             state["model_from"] = "measured front"
             keep = part.points.copy()
@@ -4027,6 +4664,15 @@ class Harness:
         self.log("part_grasp_fail", why=why)
         return None
 
+    def _taken(self, g, end, q_g):
+        """The grasp the hand went to: g itself, or its 180-degree twin (same pads, hand turned about the approach)
+        with the arm posture there."""
+        if not getattr(end, "twin", False):
+            return g, q_g
+        R = np.asarray(end.R, float)
+        info = dict(g.info, yaw=float(_wrap_pi(g.info.get("yaw", 0.0) + np.pi)), twin=True)
+        return manip.GraspCand(R, g.p, g.width, g.score, info), self._ik_near(R, g.p, self.rb.q()[:7])
+
     def _turn_reachable(self, q_g, g, mf, excl):
         """At least one turning sense is reachable with the arm clear of the scene along the way."""
         for s in (1.0, -1.0):
@@ -4115,7 +4761,7 @@ class Harness:
             prog = merge_compiles(progs)
             self.log("compiles", n=len(progs), terms={s["id"]: s["terms"] for s in prog["stages"]})
         self.program = prog
-        failures = self.ground(prog, head, [wrist] + survey)
+        failures = self.ground(prog, head, [wrist] + survey, s1_wrist=wrist)
         self.update_support_plane(self.frames)
         self.rebuild_map(self.frames)
         if failures:
@@ -4198,7 +4844,8 @@ class Harness:
         self.program = data
         self.head0 = head
         survey = []
-        failures = self.ground(data, head, [f for f in self.frames[-8:] if f.name == WRIST_CAMERA] + survey)
+        failures = self.ground(data, head, [f for f in self.frames[-8:] if f.name == WRIST_CAMERA] + survey,
+                               s1_wrist=getattr(self, "_repair_wrist", None))
         self.frames.append(head)
         self.rebuild_map(self.frames[-8:])
         if failures:
@@ -4252,6 +4899,11 @@ class Harness:
         q = self.rm.solve_ik(Rs, target, self.rb.q()[:7], n_random=6)
         if len(q):
             self.go_configs(list(q[:2]), NEAR, grip=-1.0, finger=0.04, tag="home")
+
+
+def _turn_angle(R0, R1):
+    """Rotation angle (rad) between two hand orientations."""
+    return float(np.arccos(np.clip((np.trace(np.asarray(R0).T @ np.asarray(R1)) - 1.0) / 2.0, -1.0, 1.0)))
 
 
 def _short(res):

@@ -85,7 +85,7 @@ def preshape_finger(width, gap=APPROACH_GAP):
 def grasp_candidates(obj, support_z, cur_yaw=0.0, n_yaw=18, side_clear=0.006, center=None,
                      center_radius=None, depth_options=(0.008, 0.015, 0.028, 0.04, 0.05), max_cands=80,
                      tilts=(0.0, np.deg2rad(20), -np.deg2rad(20), np.deg2rad(35), -np.deg2rad(35)),
-                     pitches=(), slab_gap=0.004):
+                     pitches=(), slab_gap=0.004, xy_step=0.01, near_r=None, voxel=0.004):
     """Antipodal grasps on a fused object point cloud: top-down plus approach tilted about the
     closing axis (lets the wrist and forearm come in from the side of nearby obstacles).
 
@@ -101,11 +101,11 @@ def grasp_candidates(obj, support_z, cur_yaw=0.0, n_yaw=18, side_clear=0.006, ce
 
     Returns candidates sorted by score (higher is better).
     """
-    pts = voxel_down(obj.points, 0.004)
-    if len(pts) < 10:
+    pts_all = voxel_down(obj.points, voxel)
+    if len(pts_all) < 10:
         return []
     fc = obj.footprint_center() if center is None else np.asarray(center[:2], float)
-    xy = voxel_down(np.c_[obj.footprint_xy(), np.zeros(len(obj.footprint_xy()))], 0.01)[:, :2]
+    xy = voxel_down(np.c_[obj.footprint_xy(), np.zeros(len(obj.footprint_xy()))], xy_step)[:, :2]
     if center_radius is not None:
         xy = xy[np.linalg.norm(xy - fc, axis=1) <= center_radius]
     xy = np.vstack([fc[None], xy])
@@ -117,6 +117,9 @@ def grasp_candidates(obj, support_z, cur_yaw=0.0, n_yaw=18, side_clear=0.006, ce
     for tilt, pitch in [(t, 0.0) for t in tilts] + [(0.0, pt) for pt in pitches]:
         Rs = np.array([top_down_rotation(y) @ _rx(tilt) @ _ry(pitch) for y in yaws])          # (Y,3,3)
         for cxy in xy:
+            # (near_r: only the points within this horizontal distance can meet the fingers and the palm here; the
+            # caller's hand checks see the whole object)
+            pts = pts_all if near_r is None else pts_all[np.linalg.norm(pts_all[:, :2] - cxy, axis=1) < near_r]
             near = np.linalg.norm(pts[:, :2] - cxy, axis=1) < 0.06
             if not near.any():
                 continue
@@ -216,6 +219,66 @@ def grasp_candidates(obj, support_z, cur_yaw=0.0, n_yaw=18, side_clear=0.006, ce
             per_tilt[t] = per_tilt.get(t, 0) + 1
     keep.sort(key=lambda g: -g.score)
     return keep
+
+
+def up_frame(n):
+    """Rotation Q (rows = frame axes) mapping world vectors into a frame where the unit direction n is +z."""
+    z = np.asarray(n, float) / np.linalg.norm(n)
+    helper = np.array([1.0, 0.0, 0.0]) if abs(z[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    x = helper - z * np.dot(helper, z)
+    x /= np.linalg.norm(x)
+    return np.stack([x, np.cross(z, x), z])
+
+
+def side_directions(n_ring=8, elevations=(0.0, np.deg2rad(45.0))):
+    """Reference directions (from the object toward the hand) for grasps other than from straight above: a ring of
+    horizontal ones and a ring at 45 degrees (with the generator's tilts of up to 35 degrees about the closing axis they
+    cover every approach from horizontal to the top-down family)."""
+    out = []
+    for el in elevations:
+        for k in range(n_ring):
+            a = 2 * np.pi * k / n_ring
+            out.append(np.array([np.cos(el) * np.cos(a), np.cos(el) * np.sin(a), np.sin(el)]))
+    return out
+
+
+def side_grasp_candidates(points, name, dirs, cur_R=None, max_per_dir=8,
+                          tilts=(0.0, np.deg2rad(25), -np.deg2rad(25))):
+    """Grasps against reference directions n other than straight down (CONTACT_STAGE_PLAN 4.5): the cloud is turned so
+    that n is up, the top-down generator runs there (its tilts lean the approach about the closing axis), and the
+    grasps are turned back (articulate.part_grasps does the same for parts). The table is not modelled here: the
+    hand-fit checks of the caller hold the hand above it."""
+    from .perception import ObjectModel
+    P = voxel_down(np.asarray(points, float), 0.005)
+    if len(P) < 10:
+        return []
+    c = P.mean(0)
+    out = []
+    for n in dirs:
+        Q = up_frame(n)
+        loc = (P - c) @ Q.T
+        tmp = ObjectModel(-3, name, name, "target", support_z=float(loc[:, 2].min()) - 0.10)
+        tmp.set_points(loc)
+        if len(tmp.points) < 10:
+            continue
+        cur_yaw = 0.0
+        if cur_R is not None:
+            Rl = Q @ np.asarray(cur_R, float)
+            cur_yaw = float(np.arctan2(Rl[1, 0], Rl[0, 0]))
+        cands = grasp_candidates(tmp, tmp.support_z, cur_yaw=cur_yaw, n_yaw=8, depth_options=(0.01, 0.025),
+                                 tilts=tilts, max_cands=12 * max_per_dir, xy_step=0.015, near_r=0.13, voxel=0.006)
+        kept = []
+        for g in cands:                       # spread over the object (a handle as well as the rim), best first
+            if len(kept) >= max_per_dir:
+                break
+            if any(np.linalg.norm(g.p - k.p) < 0.02 for k in kept):
+                continue
+            kept.append(g)
+            info = dict(g.info)
+            info["side"] = [round(float(v), 3) for v in n]
+            out.append(GraspCand(Q.T @ g.R, Q.T @ g.p + c, g.width, g.score, info))
+    out.sort(key=lambda g: -g.score)
+    return out
 
 
 # --------------------------------------------------------------------- placement

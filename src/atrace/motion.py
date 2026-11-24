@@ -21,7 +21,9 @@ from .perception import NearField
 
 TAU_LEAD = 2.0 * np.sqrt(150.0) / 150.0      # OSC kd/kp for kp=150, critically damped
 DT = 0.05
-EXACT_BELOW = 0.035                          # voxel clearance below which distances are recomputed exactly
+# voxel clearance below which distances are recomputed exactly: up to the largest sphere (link, 23.6 mm) plus TRACE's
+# largest margin (22.55 mm), so the conservative voxel value (up to ~1 voxel short) never decides a safety term
+EXACT_BELOW = 0.06
 
 
 @dataclass

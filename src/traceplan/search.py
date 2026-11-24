@@ -60,31 +60,61 @@ def _pose_ctx(R, p, v, body, src, start, end, holding, allow, dtype, device):
 
 
 # --------------------------------------------------------------------------------------------- terminal candidates
-def score_candidates(cands, snap, bodies, start, holding, ik_check, G):
-    """Drop ends that penetrate the scene or fail IK; order the rest by their terminal-term violation (stable, so
-    the harness's order decides ties) and keep G."""
+def end_test(snap, bodies, R, p, held=(), entity=None, contact=False):
+    """The end test, one rule for TRACE and the harness: clearance (m) of every body sphere at the pose (R, p) to the
+    observed scene and the table plane. A contact end (approach given) exempts the fingers from the step's named
+    target. Unseen space is not part of the test; its deepest overlap is reported so the caller can look first.
+    -> {"ok", "worst": {group, clearance, at}, "unseen": {group, depth, at} | None}"""
+    held = tuple(held)
+    x = np.asarray(R, float) @ bodies.centers.T + np.asarray(p, float)[:, None]
+    x = x.T
+    r = bodies.radii
+    clear = exact_distance(snap, x, held) - r
+    finger = bodies.groups == GROUPS.index("finger")
+    excl = held
+    if contact and entity is not None and finger.any():
+        excl = held + (entity,)
+        clear[finger] = exact_distance(snap, x[finger], excl) - r[finger]
+    if snap.table_z is not None:
+        clear = np.minimum(clear, x[:, 2] - snap.table_z - r)
+    i = int(np.argmin(clear))
+    out = {"ok": bool(clear[i] >= 0.0),
+           "worst": {"group": GROUPS[int(bodies.groups[i])], "clearance": float(clear[i]), "at": x[i].copy()},
+           "unseen": None}
+    cu = exact_distance(snap, x, held, unknown=True) - r
+    if contact and entity is not None and finger.any():
+        cu[finger] = exact_distance(snap, x[finger], excl, unknown=True) - r[finger]
+    j = int(np.argmin(cu))
+    if cu[j] < 0.0 and cu[j] < clear[j] - 1e-6:
+        out["unseen"] = {"group": GROUPS[int(bodies.groups[j])], "depth": float(-cu[j]), "at": x[j].copy()}
+    return out
+
+
+def score_candidates(cands, snap, bodies, start, holding, ik_check, G, dropped=None):
+    """Drop ends that penetrate the observed scene (end_test) or fail IK; order the rest by their terminal-term
+    violation (stable, so the harness's order decides ties) and keep G. dropped: list that receives why each end
+    left ({end, why, group, clearance, at})."""
     f64 = torch.float64
     body = Body(bodies, "cpu", f64)
     held = (holding,) if holding else ()
     keep = []
-    finger = bodies.groups == GROUPS.index("finger")
     for c in cands:
-        x = c.R @ bodies.centers.T + c.p[:, None]
-        clear = exact_distance(snap, x.T, held) - bodies.radii
-        if c.approach is not None and c.entity is not None and finger.any():
-            # a contact approach ends with the open fingers beside its target: finger geometry vs the step's named
-            # target is exempt at the standoff (TRACE integration.md, "Contact exemptions"); the path keeps the
-            # "do not get closer" rule against it through c_end
-            clear[finger] = exact_distance(snap, x.T[finger], held + (c.entity,)) - bodies.radii[finger]
-        if snap.table_z is not None:
-            clear = np.minimum(clear, x[2] - snap.table_z - bodies.radii)
-        if clear.min() < 0:
+        test = getattr(c, "test", None)
+        if test is None:
+            test = end_test(snap, bodies, c.R, c.p, held, c.entity, contact=c.approach is not None)
+        if not test["ok"]:
+            if dropped is not None:
+                dropped.append({"end": c.index, "why": "no_posture" if test.get("no_posture") else "blocked",
+                                **test["worst"]})
             continue
-        if ik_check is not None:
+        if ik_check is not None and not getattr(c, "ik_done", False):
             ok, q = ik_check(c.R, c.p, c.q)
             if not ok:
+                if dropped is not None:
+                    dropped.append({"end": c.index, "why": "no_posture", "at": np.asarray(c.p, float).copy()})
                 continue
             c.q = q if c.q is None else c.q
+        c.unseen = test["unseen"]
         t = lambda a: torch.as_tensor(np.asarray(a, float), dtype=f64)[None]
         ctx = _pose_ctx(t(c.R), t(c.p), t(c.p - start["p"]), body, Source(snap, "exact", dtype=f64), start, c.end(),
                         bool(holding), c.program.allow_contact, f64, "cpu")
