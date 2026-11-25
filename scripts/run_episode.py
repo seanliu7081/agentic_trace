@@ -35,7 +35,9 @@ def main():
     ap.add_argument("--episode", type=int, required=True)
     ap.add_argument("--out", default=None)
     ap.add_argument("--gpu", type=int, default=0)
-    ap.add_argument("--effort", default="medium")
+    ap.add_argument("--effort", default="medium",
+                    help="reasoning effort: none | minimal | low | medium | high | xhigh | max")
+    ap.add_argument("--model", default=None, help="Astra model (default: llm.MODEL, gpt-6-astra)")
     ap.add_argument("--max-calls", type=int, default=8)
     ap.add_argument("--max-wall", type=float, default=900)
     ap.add_argument("--no-verify", action="store_true")
@@ -93,7 +95,8 @@ def main():
     (out / "args.json").write_text(json.dumps(vars(args), indent=1))
     seg = Sam3Segmenter(device="cuda:0")
     seg.load()
-    astra = AstraClient(out / "model", effort=args.effort, max_calls=args.max_calls)
+    astra = AstraClient(out / "model", effort=args.effort, max_calls=args.max_calls,
+                        **({"model": args.model} if args.model else {}))
     frames = []
 
     # Test limits (evaluator-side, the harness itself stays as it is): a timer thread or the call counter sends
@@ -147,7 +150,7 @@ def main():
                 from recorder import Recorder
                 rec = Recorder(out, stride=2, meta={"task": args.task, "episode": args.episode,
                                                     "instruction": language, "hint": args.hint,
-                                                    "build": build, "effort": args.effort,
+                                                    "build": build, "effort": args.effort, "model": astra.model,
                                                     "harness": f"agentic_trace (CP-5 + TRACE, {args.motion})"})
 
             def on_step(robot, ob):
@@ -216,7 +219,8 @@ def main():
         "allowed_contacts_by_reason": col.get("allowed_contacts_by_reason"),
         "wall_s_policy": round(t_policy, 1), "wall_s_total": round(wall, 1),
         "sim_steps": robot.steps, "sim_time_s": round(robot.steps * 0.05, 1),
-        "model": astra.stats(), "timing": h.timing, "segmenter": {"calls": seg.calls, "s": round(seg.seconds, 1)},
+        "model": {"name": astra.model, "effort": args.effort, **astra.stats()}, "timing": h.timing,
+        "segmenter": {"calls": seg.calls, "s": round(seg.seconds, 1)},
         "program": h.program, "ledger": h.ledger, "repairs": h.repairs,
         "trace": h.tm.summary() if h.tm is not None else None,
     }
