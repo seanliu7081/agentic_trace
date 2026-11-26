@@ -26,6 +26,7 @@ from .guard import ContactDetector
 from .snapshot import entity_of
 from .tracemotion import TraceMotion
 from .levels import LADDER, tube as _tube
+from .lrl import CFG as LRL, LrlMixin
 from .geometry import frame_from_axes, rot_z, rotvec_to_mat, top_down_rotation, mat_to_rotvec
 from .llm import AstraError, image_part, text_part
 from . import manip
@@ -75,10 +76,11 @@ class StageFailure(Exception):
         self.info = info
 
 
-class Harness(ContactMixin):
+class Harness(ContactMixin, LrlMixin):
     def __init__(self, robot, instruction, run_dir, astra, segmenter, max_wall_s=900.0, max_repairs=2,
                  verify=True, log_images=True, prompt_note=None, motion="trace", trace_device="cuda:0",
-                 trace_budget_ms=2000.0, compiles=1, placement="ladder", in_release=None):
+                 trace_budget_ms=2000.0, compiles=1, placement="ladder", in_release=None, lrl_parts=(),
+                 lrl_weights=None):
         # in_release: None = each "in" transfer releases as the program says ("place" | "drop"); "drop" / "place":
         #   every "in" transfer uses that release, whatever the program says (a run-wide setting, all destinations).
         # placement: how a held object is put down.
@@ -90,9 +92,12 @@ class Harness(ContactMixin):
         #   "unified": the contact stage of CONTACT_STAGE_PLAN.md: System 1 points, geometry finds the rest pose near
         #             the spot, the way down carries its expected contact and the gripper opens only when it holds
         #             (contact.py); System 1 judges the result.
-        assert placement in ("ladder", "v1", "v2", "unified"), placement
+        #   "lrl":    v2, with the learned contact layer of LRL_PLAN.md (lrl.py): each part named in lrl_parts takes
+        #             the place of v2's code for its step; with no part it is v2.
+        assert placement in ("ladder", "v1", "v2", "unified", "lrl"), placement
         assert in_release in (None, "drop", "place"), in_release
         self.placement = placement
+        self.lrl_setup(placement, lrl_parts, lrl_weights)
         self.in_release = in_release
         self.rb = robot
         self.rm = robot.model
@@ -1822,7 +1827,7 @@ class Harness(ContactMixin):
 
     # ---------------------------------------------------------------- place
     def place_object(self, obj, dest, st, place_pt, result, region_override=None):
-        if self.placement == "v2" and region_override is None:
+        if self.placement in ("v2", "lrl") and region_override is None:
             return self.place_object_v2(obj, dest, st, place_pt, result)
         if self.placement == "unified" and region_override is None:
             return self.place_object_unified(obj, dest, st, place_pt, result)
@@ -3411,6 +3416,8 @@ class Harness(ContactMixin):
     def _actuate(self, st, part, parent, motion, direction, result):
         if motion in ("push", "pull"):
             return self._actuate_linear(st, part, parent, motion, result)
+        if "skill" in self.lrl_parts:
+            return self.lrl_turn(st, part, parent, direction, result)      # axes and senses as candidates (lrl.py)
         failed = []
         for attempt in range(3):
             mf = self._mount_frame(part, parent)
@@ -3571,6 +3578,7 @@ class Harness(ContactMixin):
         System 1) decide. Other goals (e.g. pressing a button): the part's face must have moved along the push."""
         goal = st.get("goal")
         want = goal if goal in ("open", "closed") else None
+        lrl = "skill" in self.lrl_parts           # the skill pushes and pulls: one candidate per attempt (lrl.py)
         if self._part_not_separated(part, parent):
             size = lambda P: np.round(np.percentile(P, 98, axis=0) - np.percentile(P, 2, axis=0), 3)
             raise StageFailure("actuation_failed", part_size_m=size(part.points), fixture_size_m=size(parent.points),
@@ -3585,14 +3593,18 @@ class Harness(ContactMixin):
         front_pt = None           # a point on the part's measured moving front (world), for the next stroke
 
         def usable(hyps):
-            use = [f for f in hyps if f["why_not"] is None and not any(self._same_face(f, b_) for b_ in bad)]
+            use = [f for f in hyps if (lrl or f["why_not"] is None) and not any(self._same_face(f, b_) for b_ in bad)]
+            if lrl:                              # v2's vetoes order the faces, they do not drop them (stable sort)
+                use.sort(key=lambda f: f["why_not"] is not None)
             if confirmed is not None and not any(self._same_face(confirmed, b_) for b_ in bad):
                 same = [f for f in use if float(np.dot(f["n"], confirmed["n"])) > np.cos(np.deg2rad(10.0))]
                 use = same + [f for f in use if not any(f is g_ for g_ in same)] if same else [confirmed] + use
             return use
 
         prev_state, no_progress = None, 0
-        for attempt in range(self.MAX_LINEAR_ATTEMPTS):
+        for attempt in range(LRL["iterations"] if lrl else self.MAX_LINEAR_ATTEMPTS):
+            if lrl and self.lrl_entered(result) >= LRL["candidates"]:
+                break
             if self.elapsed() > self.max_wall_s:
                 result["attempts"].append({"status": "wall_clock_limit"})
                 break
@@ -3632,8 +3644,11 @@ class Harness(ContactMixin):
             end_ok = self._closing_end_check(part, mf, remaining, fixture_pt) if want == "closed" else None
             # how far the hand has to push for the part to close (its measured offset, plus the end-stop margin)
             expected = remaining + self.CLOSE_PAST if (want == "closed" and remaining is not None) else None
-            plan = self.plan_part_grasp(part, parent, mf, failed, motion, end_check=end_ok)
-            if plan is not None:
+            plan = None if lrl else self.plan_part_grasp(part, parent, mf, failed, motion, end_check=end_ok)
+            if lrl:
+                stroke = self.lrl_move(motion, part, parent, mf, failed, result, want, remaining, front_pt,
+                                       fixture_pt)
+            elif plan is not None:
                 stroke = self._grip_stroke(mf, plan, motion, failed, result, part)
                 if stroke is None and motion == "push" and result["attempts"] and \
                         result["attempts"][-1].get("status") == "missed_part":
@@ -3650,6 +3665,13 @@ class Harness(ContactMixin):
                                   " found on the part from this face")
                 continue
             if stroke is None:                   # the approach failed: same face, another grasp / press point
+                continue
+            if lrl and stroke["label"] in LRL["marking"]:
+                # marked in lrl_move; no_effect: the part did not move along this face's axis, the face is done
+                if stroke["label"] == "no_effect":
+                    bad.append(mf)
+                self._face_status(faces, mf, f"used: {stroke['mode']} {motion}, hand travel {stroke['travel']:.3f} m, "
+                                             f"stop {stroke['stop']}: {stroke['label']}")
                 continue
             fb = None if front_pt is None else float((front_pt - mf["p0"]) @ np.asarray(mf["n"], float))
             fl = None if fixture_pt is None else float((fixture_pt - mf["p0"]) @ np.asarray(mf["n"], float))
@@ -3699,6 +3721,11 @@ class Harness(ContactMixin):
                 verdict = "again"
             result["attempts"][-1].update(state=self._state_words(state), verdict=verdict,
                                           **({"effect": eff} if eff else {}))
+            if lrl and (verdict == "face_suspect" or (stroke["label"] == "reached" and not verdict.startswith("done"))):
+                if stroke["label"] == "reached":
+                    self.log("lrl_disagree", stage=result["stage"], label="reached", v2=verdict,
+                             state=self._state_words(state))
+                self.lrl_mark(result, stroke, f"{stroke['label']}, v2's verdict {verdict}")
             self._face_status(faces, mf, f"used: {stroke['mode']} {motion}, hand travel {stroke['travel']:.3f} m, "
                                          f"stop {stroke['stop']}; then {self._state_words(state)}")
             if verdict.startswith("done"):
@@ -3718,13 +3745,14 @@ class Harness(ContactMixin):
             if verdict == "again":
                 prog = abs(float(state.get("face_shift_m") or 0.0))
                 no_progress = no_progress + 1 if prog < 0.005 else 0
-                if no_progress >= 2:
+                if no_progress >= 2 and not lrl:
                     # two strokes without the part moving: another stroke from the same contact will not do it
                     result["attempts"][-1]["no_progress"] = True
                     bad.append(mf)
                     no_progress = 0
             if verdict == "face_suspect":
-                bad.append(mf)
+                if not lrl:                      # lrl: the candidate is marked, the next one on this face first
+                    bad.append(mf)
                 self._face_status(faces, mf, f"used: the part did not move along this face's axis "
                                              f"(hand travel {stroke['travel']:.3f} m, stop {stroke['stop']}); "
                                              f"{self._state_words(state)}")
@@ -4572,7 +4600,9 @@ class Harness(ContactMixin):
         return done(False, None, returned=bool(seen and not hit) if seen else None, residual_changed_px=n_ch,
                     residual_net_deg=round(float(np.rad2deg(net)), 1))
 
-    def plan_part_grasp(self, part, parent, mf, failed, motion, end_check=None):
+    def plan_part_grasp(self, part, parent, mf, failed, motion, end_check=None, time_limit=None):
+        """time_limit: seconds after which the search over arm postures stops (lrl; None: no bound, as v2)."""
+        t_end = np.inf if time_limit is None else time.time() + time_limit
         R0, _ = self.rb.eef_pose()
         cands = articulate.part_grasps(part, mf, R0, max_depth=0.07 if motion in ("push", "pull") else None)
         cands = [c for c in cands if all(np.linalg.norm(c.p - f) > 0.006 for f in failed)]
@@ -4616,6 +4646,9 @@ class Harness(ContactMixin):
         fams = {}
         end_fallback = None
         for g in cands:
+            if time.time() > t_end:
+                why["search_time_limit"] = 1
+                break
             b = hand_bad(g)
             if b:
                 why[b] = why.get(b, 0) + 1
@@ -4628,6 +4661,9 @@ class Harness(ContactMixin):
                     order.append(fams[k].pop(0))
         self.log("part_grasp_prefilter", kept=len(order), rejected=dict(why))
         for g in order:
+            if time.time() > t_end:
+                why["search_time_limit"] = 1
+                break
             f = g.info["finger"]
             sols = self.ik_clear(g.R, g.p, q_now, exclude=tuple(excl), finger=f)
             if len(sols) == 0:

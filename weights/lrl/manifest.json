@@ -1,0 +1,709 @@
+{
+ "move_part_push_20261125_7770e65a.pt": {
+  "sha256": "7770e65a98dcb3e37d04d0f9a8812cb7c455172105e04c5e725dbca385e4897b",
+  "part": "skill",
+  "kind": "move_part",
+  "mode": "push",
+  "command": "/workspace/agentic_trace/src/lrl_train/train_move_part.py --name short --steps 2e6 --minutes 15 --seed 1",
+  "source": "/workspace/agentic_trace/runs/lrl_m1_20261125/train/short/ckpt_latest.pt",
+  "published": "2026-11-25T12:11:06+00:00",
+  "seed": 1,
+  "layout_seeds": [
+   0,
+   100000
+  ],
+  "kinds": [
+   "drawer_stack",
+   "door",
+   "sliding_panel",
+   "wooden_cabinet",
+   "white_cabinet",
+   "microwave"
+  ],
+  "steps": 886574,
+  "updates": 54,
+  "env": {
+   "kinds": [
+    "drawer_stack",
+    "door",
+    "sliding_panel",
+    "wooden_cabinet",
+    "white_cabinet",
+    "microwave"
+   ],
+   "seeds": [
+    0,
+    100000
+   ],
+   "time": 8.0,
+   "err_widen": 1.5,
+   "open_slide": [
+    0.03,
+    0.22
+   ],
+   "open_hinge": [
+    20.0,
+    120.0
+   ],
+   "others_open": 0.2,
+   "standoff": [
+    0.04,
+    0.08
+   ],
+   "shuffle": 0.5,
+   "pool": 3,
+   "episodes_per_layout": 8,
+   "misses": 4,
+   "max_loads": 40,
+   "damping": [
+    0.5,
+    2.0
+   ],
+   "mass": [
+    0.5,
+    2.0
+   ],
+   "finger_friction": [
+    0.5,
+    1.5
+   ],
+   "gain": [
+    0.8,
+    1.2
+   ],
+   "loss": [
+    1.0,
+    1.3
+   ],
+   "loss_add": {
+    "slide": 4.0,
+    "hinge": 0.3
+   },
+   "wrench_noise": [
+    0.3,
+    1.5
+   ],
+   "torque_arm": 0.05,
+   "wrench_bias": 2.0,
+   "wrench_drift": 0.05,
+   "delay": [
+    0,
+    2
+   ]
+  },
+  "reward": {
+   "progress": 2.0,
+   "travel_floor": 0.02,
+   "force_soft": 25.0,
+   "force": 0.02,
+   "body": 0.01,
+   "outside": 0.02,
+   "step": 0.003,
+   "residual": 0.002,
+   "done_closed": 1.0,
+   "done_open": -1.0
+  },
+  "note": "15-minute smoke run of the trainer (0.9 M steps): not the M1 policy"
+ },
+ "move_part_push_20261125_cbb22df1.pt": {
+  "sha256": "cbb22df10f859d1091db3bf9addc3506dc1c741da3f0190d46347a7c13eb94d0",
+  "part": "skill",
+  "kind": "move_part",
+  "mode": "push",
+  "source": "/workspace/agentic_trace/runs/lrl_m1_20261125/train/cont/ckpt_latest.pt",
+  "published": "2026-11-25T13:29:58+00:00",
+  "command": "/workspace/agentic_trace/src/lrl_train/train_move_part.py --name cont --steps 50e6 --minutes 85 --seed 3 --init ../runs/lrl_m1_20261125/train/long/ckpt_final.pt",
+  "seed": 3,
+  "layout_seeds": [
+   0,
+   100000
+  ],
+  "kinds": [
+   "drawer_stack",
+   "door",
+   "sliding_panel",
+   "wooden_cabinet",
+   "white_cabinet",
+   "microwave"
+  ],
+  "steps": 2037009,
+  "updates": 124,
+  "init": "../runs/lrl_m1_20261125/train/long/ckpt_final.pt",
+  "env": {
+   "kinds": [
+    "drawer_stack",
+    "door",
+    "sliding_panel",
+    "wooden_cabinet",
+    "white_cabinet",
+    "microwave"
+   ],
+   "seeds": [
+    0,
+    100000
+   ],
+   "time": 8.0,
+   "err_widen": 1.5,
+   "open_slide": [
+    0.03,
+    0.22
+   ],
+   "open_hinge": [
+    20.0,
+    120.0
+   ],
+   "others_open": 0.2,
+   "standoff": [
+    0.04,
+    0.08
+   ],
+   "shuffle": 0.5,
+   "pool": 3,
+   "starts_per_layout": 8,
+   "episodes_per_start": 2,
+   "misses": 4,
+   "max_loads": 30,
+   "damping": [
+    0.5,
+    2.0
+   ],
+   "mass": [
+    0.5,
+    2.0
+   ],
+   "finger_friction": [
+    0.5,
+    1.5
+   ],
+   "gain": [
+    0.8,
+    1.2
+   ],
+   "loss": [
+    1.0,
+    1.3
+   ],
+   "loss_add": {
+    "slide": 4.0,
+    "hinge": 0.3
+   },
+   "wrench_noise": [
+    0.3,
+    1.5
+   ],
+   "torque_arm": 0.05,
+   "wrench_bias": 2.0,
+   "wrench_drift": 0.05,
+   "delay": [
+    0,
+    2
+   ]
+  },
+  "reward": {
+   "progress": 2.0,
+   "travel_floor": 0.02,
+   "force_soft": 25.0,
+   "force": 0.05,
+   "body": 0.01,
+   "outside": 0.02,
+   "step": 0.003,
+   "residual": 0.002,
+   "done_closed": 1.0,
+   "done_open": -1.0
+  },
+  "note": "run 3 of the first M1 training (warm start from run 2, long/ckpt_final.pt, 1,986,826 steps): stopped at update 124 = 2,037,009 further steps, 26 of its 85 minutes, when a worker died on a generated layout with a plinth of zero height (scenes._carcass, fixed afterwards). 4.02 M steps in all. Evaluated in runs/lrl_m1_20261125/train/eval: below run 2 on every set. Not the M1 push policy (that was move_part_push_20261125_c3fae1aa.pt); both are superseded by the move_part entries marked \"m1\" (runs/lrl_m1_20261125/train2/NOTES.md). Corrected 2026-11-25 by the train2 track."
+ },
+ "move_part_push_20261125_c3fae1aa.pt": {
+  "sha256": "c3fae1aaa46b07f545087ba0d2580875da90e350459e907b35f0f42d4034b7ab",
+  "part": "skill",
+  "kind": "move_part",
+  "mode": "push",
+  "source": "/workspace/agentic_trace/runs/lrl_m1_20261125/train/long/ckpt_final.pt",
+  "published": "2026-11-25T13:40:49+00:00",
+  "command": "/workspace/agentic_trace/src/lrl_train/train_move_part.py --name long --steps 50e6 --minutes 90 --seed 2",
+  "seed": 2,
+  "layout_seeds": [
+   0,
+   100000
+  ],
+  "kinds": [
+   "drawer_stack",
+   "door",
+   "sliding_panel",
+   "wooden_cabinet",
+   "white_cabinet",
+   "microwave"
+  ],
+  "steps": 1986826,
+  "updates": 121,
+  "init": null,
+  "env": {
+   "kinds": [
+    "drawer_stack",
+    "door",
+    "sliding_panel",
+    "wooden_cabinet",
+    "white_cabinet",
+    "microwave"
+   ],
+   "seeds": [
+    0,
+    100000
+   ],
+   "time": 8.0,
+   "err_widen": 1.5,
+   "open_slide": [
+    0.03,
+    0.22
+   ],
+   "open_hinge": [
+    20.0,
+    120.0
+   ],
+   "others_open": 0.2,
+   "standoff": [
+    0.04,
+    0.08
+   ],
+   "shuffle": 0.5,
+   "pool": 3,
+   "episodes_per_layout": 8,
+   "misses": 4,
+   "max_loads": 30,
+   "damping": [
+    0.5,
+    2.0
+   ],
+   "mass": [
+    0.5,
+    2.0
+   ],
+   "finger_friction": [
+    0.5,
+    1.5
+   ],
+   "gain": [
+    0.8,
+    1.2
+   ],
+   "loss": [
+    1.0,
+    1.3
+   ],
+   "loss_add": {
+    "slide": 4.0,
+    "hinge": 0.3
+   },
+   "wrench_noise": [
+    0.3,
+    1.5
+   ],
+   "torque_arm": 0.05,
+   "wrench_bias": 2.0,
+   "wrench_drift": 0.05,
+   "delay": [
+    0,
+    2
+   ]
+  },
+  "reward": {
+   "progress": 2.0,
+   "travel_floor": 0.02,
+   "force_soft": 25.0,
+   "force": 0.05,
+   "body": 0.01,
+   "outside": 0.02,
+   "step": 0.003,
+   "residual": 0.002,
+   "done_closed": 1.0,
+   "done_open": -1.0
+  },
+  "note": "run 2 of 3: stopped by hand at update 121 = 1,986,826 steps (34 of 90 minutes); run 3 was warm-started from it. Evaluated in runs/lrl_m1_20261125/train/eval_long (REPORT.md)."
+ },
+ "move_part_20261125_2fad24a7.pt": {
+  "sha256": "2fad24a7f741da6cd90c74656be29efe63f223fee1bfa53e557243301e6180fb",
+  "part": "skill",
+  "kind": "move_part",
+  "modes": [
+   "push",
+   "pull",
+   "turn"
+  ],
+  "m1": true,
+  "source": "/workspace/agentic_trace/runs/lrl_m1_20261125/train2/m1b/ckpt_min60.pt",
+  "published": "2026-11-25T19:17:27+00:00",
+  "command": "/workspace/agentic_trace/src/lrl_train/train_move_part.py --name m1b --minutes 100 --steps 1e9 --envs 240 --device cuda:0 --seed 12 --init ../runs/lrl_m1_20261125/train2/m1a/ckpt_stopped.pt",
+  "seed": 12,
+  "layout_seeds": [
+   0,
+   100000
+  ],
+  "kinds": [
+   "drawer_stack",
+   "door",
+   "sliding_panel",
+   "knob",
+   "wooden_cabinet",
+   "white_cabinet",
+   "microwave",
+   "flat_stove"
+  ],
+  "steps": 9907269,
+  "updates": 301,
+  "init": "../runs/lrl_m1_20261125/train2/m1a/ckpt_stopped.pt",
+  "env": {
+   "kinds": [
+    "drawer_stack",
+    "door",
+    "sliding_panel",
+    "knob",
+    "wooden_cabinet",
+    "white_cabinet",
+    "microwave",
+    "flat_stove"
+   ],
+   "seeds": [
+    0,
+    100000
+   ],
+   "time": {
+    "push": 8.0,
+    "pull": 10.0,
+    "turn": 10.0
+   },
+   "err_widen": 1.5,
+   "err_depth": 0.01,
+   "err_turn": 0.2,
+   "open_slide": [
+    0.03,
+    0.22
+   ],
+   "open_hinge": [
+    20.0,
+    120.0
+   ],
+   "others_open": 0.2,
+   "standoff": [
+    0.04,
+    0.08
+   ],
+   "shuffle": 0.5,
+   "pull_share": 0.5,
+   "goal_slide": [
+    0.08,
+    0.25
+   ],
+   "goal_hinge": [
+    50.0,
+    110.0
+   ],
+   "goal_turn": [
+    45.0,
+    150.0
+   ],
+   "goal_over": {
+    "slide": 0.01,
+    "hinge": 0.1
+   },
+   "reach_tol": {
+    "m": 0.005,
+    "rad": 0.05
+   },
+   "grip_clear": 0.003,
+   "grip_draws": 4,
+   "grip_margin": 0.015,
+   "inject": 0.15,
+   "wrong_angle": [
+    45.0,
+    90.0
+   ],
+   "off_part": [
+    0.06,
+    0.1
+   ],
+   "slip_friction": [
+    0.02,
+    0.1
+   ],
+   "block": [
+    1000.0,
+    100000.0
+   ],
+   "pool": 3,
+   "starts_per_layout": 8,
+   "episodes_per_start": 2,
+   "misses": 4,
+   "max_loads": 20,
+   "damping": [
+    0.25,
+    6.0
+   ],
+   "mass": [
+    0.25,
+    6.0
+   ],
+   "finger_friction": [
+    0.5,
+    1.5
+   ],
+   "gain": [
+    0.8,
+    1.2
+   ],
+   "loss": [
+    1.0,
+    1.3
+   ],
+   "loss_add": {
+    "slide": 4.0,
+    "hinge": 0.3
+   },
+   "wrench_noise": [
+    0.3,
+    1.5
+   ],
+   "torque_arm": 0.05,
+   "wrench_bias": 2.0,
+   "wrench_drift": 0.05,
+   "delay": [
+    0,
+    2
+   ],
+   "effect": {
+    "m": 0.01,
+    "rad": 0.1,
+    "share": 0.2
+   },
+   "held_steps": 3,
+   "dump_share": 0.3,
+   "dump_chunk": 64
+  },
+  "reward": {
+   "progress": 2.0,
+   "travel_floor": 0.02,
+   "force_soft": 15.0,
+   "force": 0.05,
+   "body": 0.01,
+   "outside": 0.02,
+   "step": 0.003,
+   "residual": 0.002,
+   "done_closed": 1.0,
+   "done_open": -1.0,
+   "done_giveup": 0.3
+  },
+  "note": "M1 second-half policy (train2 run 2 at 60 min, warm start from run 1: 18.6 M steps in all). FAILS gate G1 in the stage simulator and is below the base law (policy None) on almost every fixture and mode: push task fixtures 36 % vs base 50 % vs stroke 40 %, pull 51 % vs 52 %, turn stove 63 % vs 93 % (full prior error, validation layouts; runs/lrl_m1_20261125/train2/NOTES.md). Its only gain: microwave pull 8 % vs 0 %. Its mean residuals are large and accumulate (orientation, steer)."
+ },
+ "detector_move_part_20261125_c2801d14.pt": {
+  "sha256": "c2801d14bdb25c4adafc59d1776aaa4ed37c5b04f562c79a4f1591d92c58d8dd",
+  "part": "detector",
+  "kind": "move_part",
+  "modes": [
+   "push",
+   "pull",
+   "turn"
+  ],
+  "m1": true,
+  "source": "/workspace/agentic_trace/runs/lrl_m1_20261125/train2/detector/detector.pt",
+  "published": "2026-11-25T19:58:28+00:00",
+  "threshold": 0.9697684645652771,
+  "data": {
+   "train": 64966,
+   "train_classes": {
+    "reached": 14541,
+    "short": 23493,
+    "no_effect": 11671,
+    "no_contact": 4687,
+    "outside": 4833,
+    "lost_grip": 5741
+   },
+   "train_sources": {
+    "base": 6000,
+    "random": 6000,
+    "train": 52966
+   },
+   "calibration": 3787,
+   "validation": 3413,
+   "unseen": 3600,
+   "dirs": [
+    "/workspace/agentic_trace/runs/lrl_m1_20261125/train2/m1a/dump",
+    "/workspace/agentic_trace/runs/lrl_m1_20261125/train2/m1b/dump",
+    "/workspace/agentic_trace/runs/lrl_m1_20261125/train2/detdata/train",
+    "/workspace/agentic_trace/runs/lrl_m1_20261125/train2/detdata/val"
+   ]
+  },
+  "note": "detector v0 of M1 second half: calibrated on even validation layout seeds (threshold reached 0.970 for 98 % precision there); report half: reached precision 97.6 %, recall 57 % (3,413 episodes); unseen fixtures: precision 90.5 %, recall 35 % (3,600). runs/lrl_m1_20261125/train2/NOTES.md"
+ },
+ "move_part_free_20261126_3d40a731.pt": {
+  "sha256": "3d40a73129faa59082f18c94af872872925088cb335fc4e584257e5fec174662",
+  "part": "skill",
+  "kind": "move_part_free",
+  "modes": [
+   "push",
+   "pull",
+   "turn"
+  ],
+  "source": "/workspace/agentic_trace/runs/lrl_m1e_20261125/e0/free/ckpt_latest.pt",
+  "published": "2026-11-26T02:16:49+00:00",
+  "command": "/workspace/agentic_trace/src/lrl_train/train_move_part.py --name free --free --steps 18629918 --minutes 100000 --envs 92 --device cuda:0 --seed 11 --out /workspace/agentic_trace/runs/lrl_m1e_20261125/e0",
+  "seed": 11,
+  "layout_seeds": [
+   0,
+   100000
+  ],
+  "kinds": [
+   "drawer_stack",
+   "door",
+   "sliding_panel",
+   "knob",
+   "wooden_cabinet",
+   "white_cabinet",
+   "microwave",
+   "flat_stove"
+  ],
+  "steps": 18643347,
+  "updates": 568,
+  "init": null,
+  "env": {
+   "kinds": [
+    "drawer_stack",
+    "door",
+    "sliding_panel",
+    "knob",
+    "wooden_cabinet",
+    "white_cabinet",
+    "microwave",
+    "flat_stove"
+   ],
+   "seeds": [
+    0,
+    100000
+   ],
+   "time": {
+    "push": 8.0,
+    "pull": 10.0,
+    "turn": 10.0
+   },
+   "err_widen": 1.5,
+   "err_depth": 0.01,
+   "err_turn": 0.2,
+   "open_slide": [
+    0.03,
+    0.22
+   ],
+   "open_hinge": [
+    20.0,
+    120.0
+   ],
+   "others_open": 0.2,
+   "standoff": [
+    0.04,
+    0.08
+   ],
+   "shuffle": 0.5,
+   "pull_share": 0.5,
+   "goal_slide": [
+    0.08,
+    0.25
+   ],
+   "goal_hinge": [
+    50.0,
+    110.0
+   ],
+   "goal_turn": [
+    45.0,
+    150.0
+   ],
+   "goal_over": {
+    "slide": 0.01,
+    "hinge": 0.1
+   },
+   "reach_tol": {
+    "m": 0.005,
+    "rad": 0.05
+   },
+   "grip_clear": 0.003,
+   "grip_draws": 4,
+   "grip_margin": 0.015,
+   "inject": 0.15,
+   "wrong_angle": [
+    45.0,
+    90.0
+   ],
+   "off_part": [
+    0.06,
+    0.1
+   ],
+   "slip_friction": [
+    0.02,
+    0.1
+   ],
+   "block": [
+    1000.0,
+    100000.0
+   ],
+   "pool": 3,
+   "starts_per_layout": 8,
+   "episodes_per_start": 2,
+   "misses": 4,
+   "max_loads": 20,
+   "damping": [
+    0.25,
+    6.0
+   ],
+   "mass": [
+    0.25,
+    6.0
+   ],
+   "finger_friction": [
+    0.5,
+    1.5
+   ],
+   "gain": [
+    0.8,
+    1.2
+   ],
+   "loss": [
+    1.0,
+    1.3
+   ],
+   "loss_add": {
+    "slide": 4.0,
+    "hinge": 0.3
+   },
+   "wrench_noise": [
+    0.3,
+    1.5
+   ],
+   "torque_arm": 0.05,
+   "wrench_bias": 2.0,
+   "wrench_drift": 0.05,
+   "delay": [
+    0,
+    2
+   ],
+   "effect": {
+    "m": 0.01,
+    "rad": 0.1,
+    "share": 0.2
+   },
+   "held_steps": 3,
+   "dump_share": 0.3,
+   "dump_chunk": 64,
+   "base": false
+  },
+  "reward": {
+   "progress": 2.0,
+   "travel_floor": 0.02,
+   "force_soft": 15.0,
+   "force": 0.05,
+   "body": 0.01,
+   "outside": 0.02,
+   "step": 0.003,
+   "residual": 0.002,
+   "change": 0.002,
+   "done_closed": 1.0,
+   "done_open": -1.0,
+   "done_giveup": 0.3
+  }
+ }
+}
