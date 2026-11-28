@@ -394,7 +394,7 @@ class Executor:
         times, Q = time_parameterize(self.rm, path, vmax=vmax, amax=amax, eef_v=eef_v, finger=finger, eef_a=eef_a)
         if grip is not None:
             self.robot.grip_cmd = grip
-        F0, _ = self.robot.wrench()
+        F0 = None if getattr(self.robot, "sensorless", False) else self.robot.wrench()[0]
         total = times[-1]
         nsteps = int(np.ceil(total / DT))
         k = 0
@@ -405,7 +405,7 @@ class Executor:
             Rc, pc = self.rm.site_pose(self.rm.full_q(q_cmd[None], finger))
             self.robot.step(Rc[0], pc[0], posture=q_cmd)
             steps += 1
-            F, _ = self.robot.wrench()
+            F = None if F0 is None else self.robot.wrench()[0]
             q_plan = self._q_at(t + DT, times, Q)
             _, pp = self.rm.site_pose(self.rm.full_q(q_plan[None], finger))
             R_act, p_act = self.robot.eef_pose()
@@ -414,8 +414,8 @@ class Executor:
                 why = guard(self.robot, F, F0, steps)
                 if why:
                     self._stop()
-                    return ExecResult(why, steps, {"t": t, "track_err": terr, "force": F.tolist()})
-            if np.linalg.norm(F - F0) > force_limit and k > 2:
+                    return ExecResult(why, steps, {"t": t, "track_err": terr, "force": None if F is None else F.tolist()})
+            if F is not None and np.linalg.norm(F - F0) > force_limit and k > 2:
                 self._stop()
                 return ExecResult("contact", steps, {"t": t, "force": (F - F0).tolist(), "track_err": terr})
             if terr > track_limit and k > 4:
@@ -451,7 +451,7 @@ class Executor:
             self.robot.grip_cmd = grip
         t, P, Q, tube = timed.t, timed.p, timed.q, timed.tube
         K = len(t)
-        F0, _ = self.robot.wrench()
+        F0 = None if getattr(self.robot, "sensorless", False) else self.robot.wrench()[0]
         first = self.robot.steps + 1
         info = {"first_step": first, "ratio_max": 0.0, "err_max": 0.0}
 
@@ -493,9 +493,9 @@ class Executor:
                     if bad is not None:
                         return stop("guard_stop", k1, err, **bad)
                 if detector is not None:
-                    F, _ = self.robot.wrench()
+                    F = None if F0 is None else self.robot.wrench()[0]
                     if detector(self.robot, F, F0, k + 1):
-                        return stop("contact", k1, err, force=(F - F0).tolist())
+                        return stop("contact", k1, err, force=[] if F is None else (F - F0).tolist())
                 if drop_check is not None and drop_check(self.robot):
                     info.update(step=k1, last_step=self.robot.steps)
                     return ExecResult("dropped", self.robot.steps - first + 1, info)

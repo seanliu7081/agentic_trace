@@ -268,7 +268,7 @@ def test_every_called_method_exists():
     import re
     from pathlib import Path
     src = Path(__file__).resolve().parents[1] / "src" / "atrace"
-    texts = {f: (src / f).read_text() for f in ("contact.py", "harness.py", "lrl.py")}
+    texts = {f: (src / f).read_text() for f in ("contact.py", "harness.py", "lrl.py", "ucs_harness.py")}
     defined = {n.name for t in texts.values() for n in ast.walk(ast.parse(t)) if isinstance(n, ast.FunctionDef)}
     called = {c for t in texts.values() for c in re.findall(r"self\.(_?[a-zA-Z]\w*)\(", t)}
     attrs = {"astra", "rb", "ex", "tm", "rm", "checker", "scene", "detector", "segmenter"}      # objects, not methods

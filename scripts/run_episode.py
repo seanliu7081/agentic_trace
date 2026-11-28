@@ -4,8 +4,8 @@ episode of a stock LIBERO task (a development or held-out task: a bddl stem and 
 
 Evaluator-only (never visible to the policy): SceneCollisionMonitor on every
 physics substep, and LIBERO's original success rule: LIBERO sets
-done = check_success() at every control step, and the episode ends as a success
-at the first done (LIBERO's own evaluation; the benchmark's reference loop).
+done = check_success() at every control step. Record its first occurrence for
+stock scoring while allowing release, retreat, and the final settle to finish.
 After the policy ends, the episode continues for ten control steps with the same
 gripper command. No step limit; the harness has its own wall budget.
 A stock task has no added obstacle, which the collision monitor needs: its evaluator-side record is the contact log
@@ -28,10 +28,6 @@ TREE = ROOT.parents[1] if ROOT.parent.name == "builds" else ROOT
 HELDOUT_SCENES = ("KITCHEN_SCENE2_", "KITCHEN_SCENE5_", "KITCHEN_SCENE7_", "KITCHEN_SCENE9_", "LIVING_ROOM_SCENE4_",
                   "STUDY_SCENE3_", "STUDY_SCENE4_")
 GPU_MINOR = {0: 3, 1: 2, 2: 1, 3: 0, 4: 7, 5: 6, 6: 5, 7: 4}   # nvidia-smi index -> /dev/nvidia minor (EGL)
-
-
-class GoalReached(BaseException):
-    """LIBERO's done: ends the episode from the step callback (BaseException passes the harness's handlers)."""
 
 
 class CapReached(BaseException):
@@ -134,13 +130,20 @@ def main():
     ap.add_argument("--no-render", action="store_true", help="with --video: record but skip the post-episode videos")
     ap.add_argument("--motion", choices=["trace", "v0", "cp5"], default="trace",
                     help="contact-free segments: TRACE search | TRACE contract with CP-5 seeds only | CP-5 planner")
-    ap.add_argument("--placement", choices=["ladder", "v1", "v2", "unified", "lrl"], default="ladder",
+    ap.add_argument("--placement", choices=["ladder", "v1", "v2", "unified", "lrl", "ucs"], default="ladder",
                     help="putting the held object down: careful planner with the margin ladder | the same planner "
                          "ranking instead of rejecting (tier 3) | no planner: System 1 points, contact ends the "
                          "descent, System 1 judges the result (r1's mechanism) | unified: System 1 points, geometry "
                          "finds the rest pose, the way down carries its expected contact, the gripper opens only when "
                          "it holds (CONTACT_STAGE_PLAN.md) | lrl: v2 with the learned contact layer of LRL_PLAN.md, "
-                         "part by part (--lrl-parts)")
+                         "part by part (--lrl-parts) | ucs: Unified Contact Stage (WholeStrokeSampler + Leaky-PLAI + "
+                         "calibrated Outcome Detector)")
+    ap.add_argument("--ucs-weights", default=None,
+                    help="with --placement ucs: directory containing detector_ucs.pt (and optional ckpt_best.pt); "
+                         "defaults to runs/ucs_g1_20261127/g1_exec_run2")
+    ap.add_argument("--ucs-use-actor", action="store_true",
+                    help="with --placement ucs: also enable the residual actor ckpt_best.pt (default: False = run "
+                         "the validated screw-compliant base guide + calibrated detector_ucs.pt)")
     ap.add_argument("--lrl-parts", default="skill,policy,detector",
                     help="with --placement lrl: comma list of the lrl parts that are on (skill, policy, detector); a "
                          "part that is off runs v2's code for its step (policy off: the skill's base law; detector "
@@ -152,6 +155,10 @@ def main():
                     help="every \"in\" transfer releases this way (drop: let go at the lowest height up to 12 cm above "
                          "the rest where the open hand is clear; place: set down on the floor), whatever the program "
                          "says; program: as the program says")
+    ap.add_argument("--safety", choices=["default", "surgical", "relaxed"], default="default",
+                    help="safety-margin profile: 'default' leaves all margins/guards unchanged; 'surgical' fixes only "
+                         "CLOSE_WINDOW narrow-side depth bloat + moderately trims TRACE perception margin; 'relaxed' "
+                         "aggressively relaxes all 7 layers")
     ap.add_argument("--trace-device", default="cuda:0")
     ap.add_argument("--trace-budget-ms", type=float, default=2000.0)
     ap.add_argument("--compiles", type=int, default=1, help="PROGRAM compiles for term confidence (1 = off)")
@@ -187,6 +194,8 @@ def main():
     import numpy as np
     import cv2
     from libero10_collision import load_episode, SceneCollisionMonitor
+    from atrace.safety import apply_safety_mode
+    safety_cfg = apply_safety_mode(args.safety)
     from atrace.harness import Harness, _jsonable
     from atrace.llm import AstraClient
     from atrace.lrl import build_suffix, load_weights, parse_parts, weights_record
@@ -194,11 +203,17 @@ def main():
     from atrace.sim_iface import SimRobot
 
     weights = None
+    ucs_bundle = None
     if args.placement == "lrl":
         parts = parse_parts(args.lrl_parts)
         wdir = Path(args.lrl_weights) if args.lrl_weights else TREE / "weights" / "lrl"
         weights = load_weights(wdir, parts)
         lrl = {"parts": list(parts), "weights": weights_record(weights)}
+    elif args.placement == "ucs":
+        from atrace.ucs_harness import load_ucs_bundle
+        uwdir = Path(args.ucs_weights) if args.ucs_weights else TREE / "runs" / "ucs_g1_20261127" / "g1_exec_run2"
+        ucs_bundle = load_ucs_bundle(uwdir, use_actor=args.ucs_use_actor)
+        lrl = None
     else:
         lrl = None
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -255,6 +270,8 @@ def main():
                                     for f in sorted((ROOT / "src" / d).glob("*.py")))
                            + (ROOT / "scripts" / "run_episode.py").read_bytes()).hexdigest()[:16]
     build += build_suffix(weights)          # the weights the run loaded: their sha256 values are part of the build
+    if ucs_bundle is not None:
+        build += ucs_bundle.get("suffix", "")
     if args.suite is None:
         episode = load_episode(args.task, args.episode)
     else:
@@ -274,7 +291,11 @@ def main():
                                                     "build": build, "effort": args.effort, "model": astra.model,
                                                     "harness": f"agentic_trace (CP-5 + TRACE, {args.motion})"})
 
+            first_libero_done_step = None
+            settle_steps = 0
+
             def on_step(robot, ob):
+                nonlocal first_libero_done_step
                 monitor.sample_endpoint() if args.suite is None else monitor.sample(robot.steps)
                 if args.video and robot.steps % 2 == 0:
                     a = ob["agentview_image"][::-1]
@@ -282,15 +303,14 @@ def main():
                     frames.append(np.concatenate([cv2.resize(a, (320, 320)), cv2.resize(w, (320, 320))], 1))
                 if rec is not None:
                     rec.on_step(robot, ob)
-                if env.check_success():
-                    cap["armed"] = False               # LIBERO's done came first: the limit no longer applies
-                    raise GoalReached
+                if first_libero_done_step is None and env.check_success():
+                    first_libero_done_step = robot.steps
             robot = SimRobot(env, on_step=on_step)
             h = Harness(robot, language, out, astra, seg, max_wall_s=args.max_wall,
                         verify=not args.no_verify, prompt_note=args.hint, motion=args.motion,
                         trace_device=args.trace_device, trace_budget_ms=args.trace_budget_ms, compiles=args.compiles,
                         placement=args.placement, lrl_parts=lrl["parts"] if lrl else (),
-                        lrl_weights=weights,
+                        lrl_weights=weights, ucs_bundle=ucs_bundle,
                         in_release=None if args.in_release == "program" else args.in_release)
             if args.true_scene and h.tm is not None:
                 # evaluator-side truth for the certificate measures: the harness hands over the request id only
@@ -302,16 +322,12 @@ def main():
                 stage_truth.attach(h, env, out / "truth.jsonl")
             if rec is not None:
                 rec.attach(h)
-            status, success_step = "stopped_at_libero_done", None
             try:
                 status = h.run()
-                robot.hold(10)
+                for _ in range(10):
+                    robot.hold(1)
+                    settle_steps += 1
                 cap["armed"] = False
-            except GoalReached:
-                success_step = robot.steps
-                if not h._events.closed:           # stopped inside the policy: end its log as Harness.run does
-                    h.log("end", status=status, timing=h.timing, astra=astra.stats())
-                    h._events.close()
             except CapReached as e:
                 status = f"cap_{e}"
                 cap.update(t=round(time.time() - t_start, 1), calls=len(astra.calls))
@@ -320,19 +336,23 @@ def main():
                     h._events.close()
             cap["armed"] = False
             t_policy = time.time() - t_start
-            col = monitor.result(raw_goal_success=bool(env.check_success()))
+            final_goal = bool(env.check_success())
+            col = monitor.result(raw_goal_success=final_goal)
     wall = time.time() - t_start
+    success_step = first_libero_done_step
     success = success_step is not None
     summary = {
         "task": args.task, "episode": args.episode, "language": language, "language_original": manifest["language"],
         **({} if args.suite is None else {"suite": args.suite, "init": args.init, "goal": manifest["goal"],
                                           "robot_contacts_over_1mm": col["robot_max_depth"],
                                           "new_object_contacts": col["object_max_depth"]}),
-        "build": build,
-        "motion": args.motion, "placement": args.placement, "lrl": lrl, "in_release": args.in_release,
+        "build": build + (f"+safety_{args.safety}" if args.safety != "default" else ""),
+        "motion": args.motion, "placement": args.placement, "safety": args.safety, "safety_cfg": safety_cfg, "lrl": lrl, "in_release": args.in_release,
         "status": status,
         "policy_finished": h.finished,
         "success": success, "success_step": success_step,
+        "first_libero_done_step": first_libero_done_step, "settle_steps": settle_steps,
+        "post_retreat_settled_goal": bool(h.finished and settle_steps == 10 and final_goal),
         "cap": {"control_s": args.cap_control_s, "calls": args.cap_calls,
                 "reached": cap["why"] if status.startswith("cap_") else None,
                 "at_s": cap["t"], "calls_at_stop": cap["calls"]},

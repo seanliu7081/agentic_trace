@@ -27,6 +27,7 @@ from .snapshot import entity_of
 from .tracemotion import TraceMotion
 from .levels import LADDER, tube as _tube
 from .lrl import CFG as LRL, LrlMixin
+from .ucs_harness import UCS_HARNESS_CFG, UCSMixin
 from .geometry import frame_from_axes, rot_z, rotvec_to_mat, top_down_rotation, mat_to_rotvec
 from .llm import AstraError, image_part, text_part
 from . import manip
@@ -76,11 +77,11 @@ class StageFailure(Exception):
         self.info = info
 
 
-class Harness(ContactMixin, LrlMixin):
+class Harness(ContactMixin, LrlMixin, UCSMixin):
     def __init__(self, robot, instruction, run_dir, astra, segmenter, max_wall_s=900.0, max_repairs=2,
                  verify=True, log_images=True, prompt_note=None, motion="trace", trace_device="cuda:0",
                  trace_budget_ms=2000.0, compiles=1, placement="ladder", in_release=None, lrl_parts=(),
-                 lrl_weights=None):
+                 lrl_weights=None, ucs_bundle=None):
         # in_release: None = each "in" transfer releases as the program says ("place" | "drop"); "drop" / "place":
         #   every "in" transfer uses that release, whatever the program says (a run-wide setting, all destinations).
         # placement: how a held object is put down.
@@ -94,10 +95,11 @@ class Harness(ContactMixin, LrlMixin):
         #             (contact.py); System 1 judges the result.
         #   "lrl":    v2, with the learned contact layer of LRL_PLAN.md (lrl.py): each part named in lrl_parts takes
         #             the place of v2's code for its step; with no part it is v2.
-        assert placement in ("ladder", "v1", "v2", "unified", "lrl"), placement
+        assert placement in ("ladder", "v1", "v2", "unified", "lrl", "ucs"), placement
         assert in_release in (None, "drop", "place"), in_release
         self.placement = placement
         self.lrl_setup(placement, lrl_parts, lrl_weights)
+        self.ucs_setup(placement, ucs_bundle)
         self.in_release = in_release
         self.rb = robot
         self.rm = robot.model
@@ -1456,15 +1458,18 @@ class Harness(ContactMixin, LrlMixin):
             g = used[int(getattr(end, "k", 0))][0]
             Rg, pg = np.asarray(end.R, float), np.asarray(end.p, float)    # the twin's orientation when it was taken
             # descend with a force guard
+            f_early = 24.0 if getattr(self, "relaxed_safety", False) else 12.0
             def guard(robot, F, F0, k):
-                return "early_contact" if np.linalg.norm(F - F0) > 12.0 and k > 2 else None
+                return "early_contact" if np.linalg.norm(F - F0) > f_early and k > 2 else None
             res = self.move_line(Rg, pg, grip=0.0, speed=0.06, guard=self._guard("early_contact", guard),
                                  finger=f_open)
             if res is None or res.status not in ("done",):
                 self.log("descend", status=None if res is None else res.status)
             short = float((pg - self.rb.eef_pose()[1]) @ Rg[:, 2])
             tip_below_top = g.info.get("depth", 0.0) + manip.TIP_Z - short     # fingertips below the object's top
-            if short > 0.006 and tip_below_top < 0.008:
+            short_lim = 0.022 if getattr(self, "relaxed_safety", False) else 0.006
+            tip_lim = 0.002 if getattr(self, "relaxed_safety", False) else 0.008
+            if short > short_lim and tip_below_top < tip_lim:
                 # stopped with the fingertips at the top: a finger is on the object, not beside it - back off and
                 # look again (as r1: the spot is not excluded; the next look corrects the object model)
                 self.retreat(Rg, pg - Rg[:, 2] * 0.10, grip=0.0, speed=0.12, finger=f_open, tag="back_off")
@@ -1483,7 +1488,9 @@ class Harness(ContactMixin, LrlMixin):
                 result["attempts"].append({"phase": "grasp", "status": "empty_close", "opening": opening})
                 continue
             dw = opening - g.width
-            if not (self.CLOSE_WINDOW[0] <= dw <= self.CLOSE_WINDOW[1]):
+            min_ratio = getattr(self, "surgical_close_ratio", None)
+            ratio_bad = min_ratio is not None and opening < max(0.003, float(min_ratio) * float(g.width))
+            if ratio_bad or not (self.CLOSE_WINDOW[0] <= dw <= self.CLOSE_WINDOW[1]):
                 # the pads did not meet the object where planned (slid off, pushed it, or closed on something else):
                 # no lift; open, back off, and the next attempt grasps another region
                 open_hand()
@@ -1666,6 +1673,8 @@ class Harness(ContactMixin, LrlMixin):
             d = self.object_clearance(obj.points, g.p + L @ g.R.T, g.info.get("side"),
                                       self.__dict__.setdefault("_side_model_cache", {})) - rad \
                 if g.info.get("side") is not None else obj.signed_clearance(g.p + L @ g.R.T) - rad
+            if getattr(self, "relaxed_safety", False):
+                return d[grp == 1].min() >= -0.002 and d[grp == 2].min() >= -0.003
             return d[grp == 1].min() >= 0.006 and d[grp == 2].min() >= 0.0015
         def hand_ok(g):
             # fully open hand (binary open, as r1) wherever it fits; otherwise the widest pre-shape the
@@ -1715,7 +1724,10 @@ class Harness(ContactMixin, LrlMixin):
                     continue
                 # a grasp is a whole motion: the lift that follows must have a posture all the way up too
                 lift = self.line_configs(g.R, g.p + np.array([0.0, 0.0, 0.10]), line[-1], finger=f)
-                if lift is None or jm(lift) < 0.04:
+                if lift is None and getattr(self, "relaxed_safety", False):
+                    lift = self.line_configs(g.R, g.p + np.array([0.0, 0.0, 0.05]), line[-1], finger=f)
+                lift_jm = 0.002 if getattr(self, "relaxed_safety", False) else 0.04
+                if lift is None or jm(lift) < lift_jm:
                     continue
                 self.log("grasp_plan", p=g.p, yaw=g.info["yaw"], tilt=g.info.get("tilt"), side=g.info.get("side"),
                          approach=g.R[:, 2], width=g.width, tried=tried,
@@ -1823,11 +1835,13 @@ class Harness(ContactMixin, LrlMixin):
         if not good[0]:
             return False
         f = self.checker.fine(q[None], [obj.oid], finger=finger)
+        if getattr(self, "relaxed_safety", False):
+            return f["palm"][0] >= -0.002 and f["finger"][0] >= -0.003 and f["arm"][0] >= 0.002
         return f["palm"][0] >= 0.006 and f["finger"][0] >= 0.0015 and f["arm"][0] >= 0.01
 
     # ---------------------------------------------------------------- place
     def place_object(self, obj, dest, st, place_pt, result, region_override=None):
-        if self.placement in ("v2", "lrl") and region_override is None:
+        if self.placement in ("v2", "lrl", "ucs") and region_override is None:
             return self.place_object_v2(obj, dest, st, place_pt, result)
         if self.placement == "unified" and region_override is None:
             return self.place_object_unified(obj, dest, st, place_pt, result)
@@ -3416,6 +3430,8 @@ class Harness(ContactMixin, LrlMixin):
     def _actuate(self, st, part, parent, motion, direction, result):
         if motion in ("push", "pull"):
             return self._actuate_linear(st, part, parent, motion, result)
+        if getattr(self, "ucs", False):
+            return self.ucs_turn(st, part, parent, direction, result)
         if "skill" in self.lrl_parts:
             return self.lrl_turn(st, part, parent, direction, result)      # axes and senses as candidates (lrl.py)
         failed = []
@@ -3579,6 +3595,7 @@ class Harness(ContactMixin, LrlMixin):
         goal = st.get("goal")
         want = goal if goal in ("open", "closed") else None
         lrl = "skill" in self.lrl_parts           # the skill pushes and pulls: one candidate per attempt (lrl.py)
+        ucs = getattr(self, "ucs", False)
         if self._part_not_separated(part, parent):
             size = lambda P: np.round(np.percentile(P, 98, axis=0) - np.percentile(P, 2, axis=0), 3)
             raise StageFailure("actuation_failed", part_size_m=size(part.points), fixture_size_m=size(parent.points),
@@ -3593,17 +3610,23 @@ class Harness(ContactMixin, LrlMixin):
         front_pt = None           # a point on the part's measured moving front (world), for the next stroke
 
         def usable(hyps):
-            use = [f for f in hyps if (lrl or f["why_not"] is None) and not any(self._same_face(f, b_) for b_ in bad)]
-            if lrl:                              # v2's vetoes order the faces, they do not drop them (stable sort)
+            rel_s = getattr(self, "relaxed_safety", False)
+            use = [f for f in hyps if (lrl or ucs or rel_s or f["why_not"] is None) and not any(self._same_face(f, b_) for b_ in bad)]
+            if lrl or rel_s:                     # v2's vetoes order the faces, they do not drop them (stable sort)
                 use.sort(key=lambda f: f["why_not"] is not None)
+            if ucs:                              # physical prior: horizontal/level slide axes before upward edges!
+                use.sort(key=lambda f: (abs(float(f["n"][2])) > 0.65, f["why_not"] is not None))
             if confirmed is not None and not any(self._same_face(confirmed, b_) for b_ in bad):
                 same = [f for f in use if float(np.dot(f["n"], confirmed["n"])) > np.cos(np.deg2rad(10.0))]
                 use = same + [f for f in use if not any(f is g_ for g_ in same)] if same else [confirmed] + use
             return use
 
         prev_state, no_progress = None, 0
-        for attempt in range(LRL["iterations"] if lrl else self.MAX_LINEAR_ATTEMPTS):
+        max_att = LRL["iterations"] if lrl else (UCS_HARNESS_CFG["max_candidates"] * 2 if ucs else self.MAX_LINEAR_ATTEMPTS)
+        for attempt in range(max_att):
             if lrl and self.lrl_entered(result) >= LRL["candidates"]:
+                break
+            if ucs and self._ucs_stage_mem(result)["entered"] >= UCS_HARNESS_CFG["max_candidates"]:
                 break
             if self.elapsed() > self.max_wall_s:
                 result["attempts"].append({"status": "wall_clock_limit"})
@@ -3644,8 +3667,11 @@ class Harness(ContactMixin, LrlMixin):
             end_ok = self._closing_end_check(part, mf, remaining, fixture_pt) if want == "closed" else None
             # how far the hand has to push for the part to close (its measured offset, plus the end-stop margin)
             expected = remaining + self.CLOSE_PAST if (want == "closed" and remaining is not None) else None
-            plan = None if lrl else self.plan_part_grasp(part, parent, mf, failed, motion, end_check=end_ok)
-            if lrl:
+            plan = None if (lrl or ucs) else self.plan_part_grasp(part, parent, mf, failed, motion, end_check=end_ok)
+            if ucs:
+                stroke = self.ucs_move(motion, part, parent, mf, failed, result, want, remaining, front_pt,
+                                       fixture_pt)
+            elif lrl:
                 stroke = self.lrl_move(motion, part, parent, mf, failed, result, want, remaining, front_pt,
                                        fixture_pt)
             elif plan is not None:
@@ -3950,11 +3976,12 @@ class Harness(ContactMixin, LrlMixin):
             result["attempts"].append({"status": "transit_failed", "why": (self.last_move or {}).get("why")})
             return None
         g, q_g = self._taken(g, end, q_g)
+        f_early_p = 24.0 if getattr(self, "relaxed_safety", False) else 10.0
         def guard(robot, F, F0, k):
-            return "early_contact" if np.linalg.norm(F - F0) > 10.0 and k > 2 else None
+            return "early_contact" if np.linalg.norm(F - F0) > f_early_p and k > 2 else None
         self.move_line(g.R, g.p, grip=0.0, speed=0.05, guard=self._guard("early_contact", guard), finger=f_open)
         short = float((g.p - self.rb.eef_pose()[1]) @ g.R[:, 2])
-        if short > 0.006:
+        if short > (0.025 if getattr(self, "relaxed_safety", False) else 0.006):
             failed.append(g.p)
             Rs, ps = self.rb.eef_pose()
             self.retreat(Rs, ps - Rs[:, 2] * 0.08, grip=0.0, speed=0.12, finger=f_open, tag="back_off")
@@ -4103,8 +4130,9 @@ class Harness(ContactMixin, LrlMixin):
                                        "why": (self.last_move or {}).get("why")})
             return None
         R = np.asarray(end.R, float)                 # closed fingertips are symmetric: the twin presses the same
+        f_press_c = 14.0 if getattr(self, "relaxed_safety", False) else 8.0
         def guard(robot, F, F0, k):
-            return "contact" if np.linalg.norm(F - F0) > 8.0 and k > 2 else None
+            return "contact" if np.linalg.norm(F - F0) > f_press_c and k > 2 else None
         if mode == "tip":
             self.move_line(R, p_touch + a_dir * 0.01, grip=1.0, speed=0.04, guard=self._guard("contact", guard),
                            finger=0.0)                                                    # in until contact
@@ -4283,11 +4311,8 @@ class Harness(ContactMixin, LrlMixin):
     CLOSE_PAST = 0.01       # m: a closing stroke is planned to reach this far past flush (end stops sit behind the face)
 
     def _closing_end_check(self, part, mf, remaining, fixture_pt):
-        """For a closing push whose remaining travel is measured: a check(R, p, q_ref, finger) that the hand pose (R, p)
-        moved along the push until the part is CLOSE_PAST behind its fixture face stays clear of the fixture's static
-        surfaces (observed points at or behind the fixture face: the fixture's own edges around the part included). A
-        press or grip that would jam on the fixture before the part closes is not preferred. The check returns the
-        clearance margin (>= 0: clear); None when the remaining travel is not known."""
+        if getattr(self, "relaxed_safety", False):
+            return None
         if remaining is None or fixture_pt is None:
             return None
         n = np.asarray(mf["n"], float)
@@ -4636,9 +4661,10 @@ class Harness(ContactMixin, LrlMixin):
                     return "hand_table"
             W0 = g.p + L @ g.R.T
             dp = part.surface_distance(W0) - rad
-            if dp[grp == 1].min() < 0.006:
+            rel_s = getattr(self, "relaxed_safety", False)
+            if dp[grp == 1].min() < (-0.002 if rel_s else 0.006):
                 return "hand_part"
-            if parent is not None:
+            if parent is not None and not rel_s:
                 d2 = parent.surface_distance(W0) - rad
                 if d2[grp == 1].min() < 0.008 or d2[grp == 2].min() < 0.003:
                     return "hand_parent"
@@ -4721,7 +4747,7 @@ class Harness(ContactMixin, LrlMixin):
                     good = False
                     break
                 c = self.checker.clearance(q, exclude=tuple(excl), finger=0.0)
-                if c["arm"][0] < NEAR["arm"]:
+                if c["arm"][0] < (0.0 if getattr(self, "relaxed_safety", False) else NEAR["arm"]):
                     good = False
                     break
                 q_prev = q[0]
@@ -4742,12 +4768,13 @@ class Harness(ContactMixin, LrlMixin):
         good, c = self.checker.ok(q[None], NEAR, exclude=tuple(excl), finger=finger)
         if not good[0]:
             return "scene_" + min((k for k in c if c[k][0] < NEAR.get(k, 0.02)), key=lambda k: c[k][0])
+        rel_s = getattr(self, "relaxed_safety", False)
         f = self._surface_clear(q, part, finger)
-        if f["palm"] < 0.006 or f["finger"] < 0.001:
+        if f["palm"] < (-0.002 if rel_s else 0.006) or f["finger"] < (-0.004 if rel_s else 0.001):
             return "part"
         if parent is not None:
             f2 = self._surface_clear(q, parent, finger)
-            if f2["palm"] < 0.008 or f2["finger"] < 0.003 or f2["arm"] < 0.01:
+            if f2["palm"] < (-0.002 if rel_s else 0.008) or f2["finger"] < (-0.004 if rel_s else 0.003) or f2["arm"] < (0.002 if rel_s else 0.01):
                 return "parent"
         return None
 

@@ -415,15 +415,22 @@ def door(rng, name="lrl_door", cfg=CFG):
         pos, axis, off, along, span = [-tp / 2, 0, zc + s * H / 2], [0, -s, 0], np.array([0, 0, -s * H / 2]), 1, W
         damp = rng.uniform(*cfg["hinge_damping"])
         fric = rng.uniform(*cfg["flap_hold"]) * rho * tp * W * H * 9.81 * H / 2
+    # The same physical hinge can use either signed joint coordinate.
+    convention = cfg.get("hinge_coordinate_sign", 1)
+    if convention < 0:
+        axis = -np.asarray(axis)
+    travel = convention * th
+    limits = (min(0., travel), max(0., travel))
+    range_text = f"{travel:.4f} 0" if convention < 0 else f"0 {travel:.4f}"
     h = np.array([tp / 2, W / 2, H / 2])
     hx, handle = _handle(rng, f"{name}_p0", style, p, off * 1.6 + [tp / 2, 0, 0], along, span, rho)
     r_lo = None if cfg is CFG else cfg["open_reach"] + 0.5 * W
     xml = (f'<body name="{name}" {_mount(rng, -tp - c - D, W / 2, z0 + H, cfg, r_lo)}>{body}'
            f'<body name="{name}_p0" pos="{_v(pos)}">'
-           f'<joint name="{name}_j0" type="hinge" axis="{_v(axis)}" limited="true" range="0 {th:.4f}" '
+           f'<joint name="{name}_j0" type="hinge" axis="{_v(axis)}" limited="true" range="{range_text}" '
            f'damping="{damp:.3f}" frictionloss="{fric:.3f}"/>'
            + _box(f"{name}_panel", off - h, off + h, "0.6 0.45 0.3 1", rho) + hx + "</body></body>")
-    return _finish(xml, [_part(name, 0, "hinge", [name], (0.0, th), (0.0, th), (W / 2, H / 2), p,
+    return _finish(xml, [_part(name, 0, "hinge", [name], limits, (0.0, travel), (W / 2, H / 2), p,
                                off + [tp / 2, 0, 0], handle=handle, handle_kind=style)])
 
 

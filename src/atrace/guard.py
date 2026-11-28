@@ -78,9 +78,9 @@ class ContactDetector:
         self.hits = self.hits + 1 if x > thr else 0
         if x <= thr:
             self.free.append(err)
-        push = float((F - (F0 if self.F_ref is None else self.F_ref)) @ u)
+        push = None if F is None else float((F - (F0 if self.F_ref is None else self.F_ref)) @ u)
         self.last = {"err": err, "thr": thr, "mu": mu, "force": push}
-        return x > c["strong"] * thr or self.hits >= c["hits"] or (push > self.f_thr and err > c["e_push"])
+        return x > c["strong"] * thr or self.hits >= c["hits"] or (push is not None and push > self.f_thr and err > c["e_push"])
 
     def guard(self, reason, rule=None):
         """A guard with CP-5's signature (robot, F, F0, k) -> reason | None: CP-5's own force rule `rule` is kept
@@ -88,7 +88,7 @@ class ContactDetector:
         self.reset()
 
         def g(robot, F, F0, k):
-            why = rule(robot, F, F0, k) if rule is not None else None
+            why = rule(robot, F, F0, k) if rule is not None and F is not None else None
             if why:
                 return why
             return reason if self.update(robot.q(), robot.joint_vel(), robot.last_goal, F, F0) else None

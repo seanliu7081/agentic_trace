@@ -102,9 +102,9 @@ class Cameras:
                 lut[g.segid + 1] = m.site_bodyid[g.objid]
         return lut
 
-    def render(self, names=None):
+    def render(self, names=None, *, data=None):
         self.gl.make_current()
-        m, d, out = self.m, self.d, []
+        m, d, out = self.m, self.d if data is None else data, []
         for n, cid in zip(self.names, self.ids):
             if names is not None and n not in names:
                 continue

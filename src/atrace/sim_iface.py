@@ -89,6 +89,7 @@ class SimRobot:
         self.on_step = on_step
         self.steps = 0
         self.grip_cmd = -1.0
+        self.sensorless = False
         body_names = [mujoco.mj_id2name(self.m, mujoco.mjtObj.mjOBJ_BODY, b) or "" for b in range(self.m.nbody)]
         robot_bodies = {b for b, n in enumerate(body_names)
                         if n.startswith(("robot0_", "gripper0_", "mount0_"))}
@@ -126,6 +127,8 @@ class SimRobot:
 
     def wrench(self):
         """Wrist F/T (sensor frame) -> world-frame force and torque."""
+        if self.sensorless:
+            raise RuntimeError("Wrist F/T is disabled for this sensorless robot")
         f = np.array(self.robot.ee_force, dtype=float)
         t = np.array(self.robot.ee_torque, dtype=float)
         sid = mujoco.mj_name2id(self.m, mujoco.mjtObj.mjOBJ_SITE, "gripper0_ft_frame")
